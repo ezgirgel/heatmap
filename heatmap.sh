@@ -1,0 +1,901 @@
+#!/bin/bash
+# ============================================================================
+# heatmap.sh — GIF-карты перемещений игроков (QuakeWorld / mvdsv)
+#
+# Точка входа пост-обработки партии: вызывается mvdsv после матча без
+# аргументов (вся информация о партии — в demoinfo-файле). По каждому игроку
+# строит анимированный GIF перемещений на фоне подложки карты.
+#
+# Вызов:  heatmap.sh [путь-к-demoinfo]
+#         $1 (опционально) перекрывает DEMOINFO_FILE из конфига.
+#
+# Коды возврата (FR-3):
+#   0 — успех (в том числе при частичных WARN по отдельным игрокам)
+#   1 — конфигурация/окружение
+#   2 — входные данные (demoinfo/демка)
+#   3 — сбой внешнего инструмента (bsp2bmp, mvdparser, gnuplot, make_mapinfo)
+#   4 — таймаут блокировки (flock)
+#
+# Все пути и параметры — в heatmap.conf (раздел 7 ТЗ). Зашитых абсолютных
+# путей в коде нет (T-13).
+#
+# Окружение: bash >= 5.1, gnuplot >= 5.4 (pngcairo), ImageMagick 6 (синтаксис
+# IM6, совместим с IM7), jq >= 1.6, python3 >= 3.9 (только stdlib).
+# ============================================================================
+
+set -euo pipefail
+umask 022
+export LC_ALL=C
+
+# ----------------------------------------------------------------------------
+# Служебные функции, доступные до инициализации лога
+# ----------------------------------------------------------------------------
+
+# дату/время для сообщений до инициализации лога
+_now() { date +%Y-%m-%dT%H:%M:%S%z; }
+
+_prelog() { printf '%s [%s] %s\n' "$(_now)" "$1" "$2" >&2; }
+
+# Фатальный выход: сообщение в stderr (лог ещё может быть не инициализирован)
+_die_early() {
+    local code="$1"; shift
+    _prelog "ERROR" "$*"
+    exit "$code"
+}
+
+# ----------------------------------------------------------------------------
+# FR-2: собственный каталог определяется по BASH_SOURCE, работает из любого CWD
+# ----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+export SCRIPT_DIR
+
+ORIG_ARGS=("$@")
+
+# ----------------------------------------------------------------------------
+# FR-5: конфиг обязателен
+# ----------------------------------------------------------------------------
+CONFIG="${SCRIPT_DIR}/heatmap.conf"
+if [[ ! -r "$CONFIG" ]]; then
+    _die_early 1 "конфиг не найден или не читается: ${CONFIG} (FR-5)"
+fi
+# shellcheck source=heatmap.conf
+source "$CONFIG"
+
+# ----------------------------------------------------------------------------
+# Дефолты раздела 7 (FR-7): запуск без части ключей не падает, если ключ
+# не обязателен. Обязательные: QW_MAP_DIR, DEMO_DIR, DEMOINFO_FILE.
+# ----------------------------------------------------------------------------
+: "${QW_MAP_DIR:=}"
+: "${DEMO_DIR:=}"
+: "${DEMOINFO_FILE:=}"
+: "${BLANK_MAP_DIR:=${SCRIPT_DIR}/blank_map}"
+: "${RESULT_DIR:=${SCRIPT_DIR}/result}"
+: "${LOG_DIR:=${SCRIPT_DIR}/logs}"
+: "${TMP_BASE:=${SCRIPT_DIR}/tmp}"
+: "${MVDPARSER_BIN:=${SCRIPT_DIR}/mvdparser}"
+: "${FRAGFILE:=${SCRIPT_DIR}/fragfile.dat}"
+: "${TEMPLATE_TPL:=${SCRIPT_DIR}/template.tpl}"
+: "${GNUPLOT_SCRIPT:=${SCRIPT_DIR}/xy.gnuplot}"
+: "${BSP2BMP_BIN:=${SCRIPT_DIR}/bsp2bmp_3800}"
+: "${BSP2BMP_ARGS:=-s4 -z0 -p0 -e -c+Z}"
+: "${LOCK_FILE:=${TMP_BASE}/heatmap.lock}"
+
+: "${GIF_MODE:=interleave}"
+: "${CHUNK_SECONDS:=30}"
+: "${MAX_FRAMES:=20}"
+: "${MAX_FRAMES_CAP:=120}"
+: "${MIN_DATA_LINES:=10}"
+: "${GIF_DELAY_CS:=5}"
+: "${GIF_LOOP:=0}"
+: "${GIF_OPTIMIZE_FUZZ:=10}"
+
+: "${PALETTE_MIN_COLOR:=blue}"
+: "${PALETTE_MAX_COLOR:=red}"
+: "${PALETTE_CUSTOM:=}"
+: "${MARKER_MOVE_TYPE:=5}"
+: "${MARKER_MOVE_SIZE:=5}"
+: "${MARKER_DEATH_TYPE:=2}"
+: "${MARKER_DEATH_SIZE:=2}"
+: "${BLANK_MAP_NEGATE:=true}"
+: "${Z_OUTLIER_MIN_COUNT:=10}"
+: "${MAPINFO_PADDING:=10}"
+: "${MAPINFO_SCALING:=4}"
+
+: "${RETENTION_MAX_AGE_DAYS:=90}"
+: "${RETENTION_MAX_DIRS:=200}"
+: "${LOG_RETENTION_DAYS:=30}"
+: "${LOCK_WAIT_SEC:=1800}"
+: "${KEEP_TMP_ON_FAIL:=true}"
+: "${NICE_LEVEL:=}"
+
+# ----------------------------------------------------------------------------
+# Валидация конфига (FR-6)
+# ----------------------------------------------------------------------------
+is_int()   { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_num()   { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+
+validate_conf() {
+    local key
+    # обязательные ключи
+    for key in QW_MAP_DIR DEMO_DIR DEMOINFO_FILE; do
+        if [[ -z "${!key}" ]]; then
+            _die_early 1 "конфиг: обязательный ключ ${key} пуст (FR-6)"
+        fi
+    done
+    # числовые ключи
+    local int_keys=(
+        CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES
+        GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
+        Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
+        RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
+        LOCK_WAIT_SEC
+    )
+    for key in "${int_keys[@]}"; do
+        if [[ -n "${!key}" ]] && ! is_int "${!key}"; then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' не является целым числом (FR-6)"
+        fi
+    done
+    # GIF_MODE — перечисление
+    if [[ "$GIF_MODE" != "interleave" && "$GIF_MODE" != "chunks" ]]; then
+        _die_early 1 "конфиг: GIF_MODE='${GIF_MODE}' — допустимо interleave|chunks (FR-6)"
+    fi
+    # логические ключи
+    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL)
+    for key in "${bool_keys[@]}"; do
+        local v="${!key,,}"
+        if [[ "$v" != "true" && "$v" != "false" ]]; then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — допустимо true|false (FR-6)"
+        fi
+        printf -v "$key" '%s' "$v"
+    done
+    # маркеры: *_TYPE — целое 1..15; *_SIZE — число > 0 (7.3, FR-6)
+    for key in MARKER_MOVE_TYPE MARKER_DEATH_TYPE; do
+        if ! is_int "${!key}" || (( 10#${!key} < 1 || 10#${!key} > 15 )); then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — целое 1..15 (pointtype gnuplot, FR-6)"
+        fi
+    done
+    for key in MARKER_MOVE_SIZE MARKER_DEATH_SIZE; do
+        if ! is_num "${!key}" ; then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — число > 0 (pointsize, FR-6)"
+        fi
+        if awk -v v="${!key}" 'BEGIN{exit !(v > 0)}'; then :; else
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — должен быть > 0 (FR-6)"
+        fi
+    done
+    # NICE_LEVEL: пусто или 0..19
+    if [[ -n "$NICE_LEVEL" ]] && { ! is_int "$NICE_LEVEL" || (( 10#$NICE_LEVEL > 19 )); }; then
+        _die_early 1 "конфиг: NICE_LEVEL='${NICE_LEVEL}' — пусто или целое 0..19 (FR-6)"
+    fi
+}
+
+# неизвестные ключи — WARN (защита от опечаток).
+# Подход «diff»: список переменных до и после source конфига — иммунитет
+# к служебным переменным bash (BASH_*, SHELLOPTS и т.п.) на любой версии.
+# Diff сам по себе выдаёт ВСЕ ключи конфига, поэтому результат фильтруется
+# по ассоциативному массиву известных ключей раздела 7 ТЗ: WARN получают
+# только действительно неизвестные (служебные переменные bash вида
+# PIPESTATUS, затесавшиеся в diff, тоже отсекаются).
+check_unknown_keys() {
+    local base full k
+    local -A known=()
+    local known_keys=(
+        QW_MAP_DIR DEMO_DIR DEMOINFO_FILE
+        BLANK_MAP_DIR BLANK_MAP_NEGATE
+        MVDPARSER_BIN FRAGFILE TEMPLATE_TPL GNUPLOT_SCRIPT
+        BSP2BMP_BIN BSP2BMP_ARGS
+        RESULT_DIR LOG_DIR TMP_BASE LOCK_FILE
+        GIF_MODE CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES
+        GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
+        PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
+        MARKER_MOVE_TYPE MARKER_MOVE_SIZE MARKER_DEATH_TYPE MARKER_DEATH_SIZE
+        Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
+        RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
+        LOCK_WAIT_SEC KEEP_TMP_ON_FAIL NICE_LEVEL
+    )
+    for k in "${known_keys[@]}"; do known["$k"]=1; done
+    # «base» исполняет такой же однотактный пайплайн, как source в «full» —
+    # иначе спецпеременные bash (PIPESTATUS и т.п.), выставляемые пайплайном
+    # перед compgen, попадали бы в diff и давали ложный WARN на каждом прогоне.
+    base="$(env -i PATH="$PATH" HOME="${HOME:-/root}" SCRIPT_DIR="$SCRIPT_DIR" \
+        bash -c ': >/dev/null 2>&1; compgen -v' 2>/dev/null | sort -u || true)"
+    full="$(env -i PATH="$PATH" HOME="${HOME:-/root}" SCRIPT_DIR="$SCRIPT_DIR" \
+        bash -c 'source "$1" >/dev/null 2>&1; compgen -v' _ "$CONFIG" 2>/dev/null | sort -u || true)"
+    if [[ -z "$full" ]]; then
+        log "WARN" "конфиг: не удалось автоматически проверить неизвестные ключи (FR-6)"
+        return 0
+    fi
+    while IFS= read -r k; do
+        [[ -z "$k" ]] && continue
+        [[ -n "${known[$k]:-}" ]] && continue
+        log "WARN" "конфиг: неизвестный ключ '${k}' — проверьте опечатки (FR-6)"
+    done < <(comm -13 <(printf '%s\n' "$base") <(printf '%s\n' "$full"))
+}
+
+validate_conf
+
+# ----------------------------------------------------------------------------
+# Инициализация лога (FR-32): logs/heatmap-YYYY-MM-DD.log, append + stdout
+# ----------------------------------------------------------------------------
+mkdir -p "$LOG_DIR" 2>/dev/null || _die_early 1 "не удалось создать каталог логов: ${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/heatmap-$(date +%F).log"
+touch "$LOG_FILE" 2>/dev/null || _die_early 1 "не удалось открыть лог: ${LOG_FILE}"
+
+# Подводный камень (найден на прогоне): nice-перезапуск (FR-4) исполняет скрипт
+# повторно, и без защиты здесь выстраивалась цепочка tee->tee — каждая строка
+# попадала в файл лога дважды. Флаг-хранец делает инициализацию одноразовой:
+# повторный проход наследует уже установленный редирект (одна цепочка tee).
+if [[ "${_HM_LOG_TEE:-0}" != "1" ]]; then
+    exec &> >(tee -a "$LOG_FILE")
+    export _HM_LOG_TEE=1
+fi
+
+log() {
+    local level="$1"; shift
+    printf '%s [%s] %s\n' "$(_now)" "$level" "$*"
+}
+
+die() {
+    local code="$1"; shift
+    log ERROR "$*"
+    exit "$code"
+}
+
+log INFO "=== heatmap: старт (pid $$, log ${LOG_FILE}) ==="
+
+# FR-6: неизвестные ключи — WARN. Проверка идёт ПОСЛЕ инициализации лога,
+# чтобы WARN попал в файл лога при любом NICE_LEVEL (без nice второго прохода
+# нет, а prelog в stderr до редиректа в лог не попадает). Флаг-хранец —
+# однократность: во втором проходе nice-перезапуска (FR-4) проверка не
+# повторяется, иначе WARN задваивался бы.
+if [[ "${_HM_UNK_CHECKED:-0}" != "1" ]]; then
+    export _HM_UNK_CHECKED=1
+    check_unknown_keys
+fi
+
+# ----------------------------------------------------------------------------
+# FR-4: перезапуск через nice (до flock, с сохранением аргументов)
+# ----------------------------------------------------------------------------
+if [[ -n "$NICE_LEVEL" && "${_HM_NICE_DONE:-0}" != "1" ]]; then
+    log INFO "перезапуск через nice -n ${NICE_LEVEL} (FR-4)"
+    export _HM_NICE_DONE=1
+    exec nice -n "$NICE_LEVEL" bash "$SCRIPT_DIR/heatmap.sh" "${ORIG_ARGS[@]}"
+fi
+
+# ----------------------------------------------------------------------------
+# Окружение: наличие инструментов (код 1)
+# ----------------------------------------------------------------------------
+need_bin=(jq gnuplot convert composite mogrify identify flock python3 awk sed basename stat du find date tee realpath)
+for cmd in "${need_bin[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        die 1 "не найден необходимый инструмент: ${cmd} (код 1)"
+    fi
+done
+if [[ ! -x "$MVDPARSER_BIN" ]]; then die 1 "mvdparser не найден или не исполняем: ${MVDPARSER_BIN}"; fi
+if [[ ! -x "$BSP2BMP_BIN" ]]; then die 1 "bsp2bmp не найден или не исполняем: ${BSP2BMP_BIN}"; fi
+if [[ ! -r "$FRAGFILE" ]]; then die 1 "fragfile не найден: ${FRAGFILE}"; fi
+if [[ ! -r "$TEMPLATE_TPL" ]]; then die 1 "template.tpl не найден: ${TEMPLATE_TPL}"; fi
+if [[ ! -r "$GNUPLOT_SCRIPT" ]]; then die 1 "xy.gnuplot не найден: ${GNUPLOT_SCRIPT}"; fi
+
+# ----------------------------------------------------------------------------
+# Санитизация имён (8.5): вне A-Za-z0-9._- -> '_'; схлопнуть '_'; срезать края;
+# обрезать до 64; пусто -> '' (вызывающий подставит player_<слот>)
+# ----------------------------------------------------------------------------
+sanitize_name() {
+    local s="$1"
+    s="$(printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '_')"
+    s="${s//__*/_}"
+    # схлопывание подряд идущих '_' и срезка краёв
+    while [[ "$s" == *'__'* ]]; do s="${s//__/_}"; done
+    while [[ "$s" == _* ]]; do s="${s#_}"; done
+    while [[ "$s" == *_ ]]; do s="${s%_}"; done
+    if (( ${#s} > 64 )); then
+        s="${s:0:64}"
+        while [[ "$s" == *_ ]]; do s="${s%_}"; done
+    fi
+    printf '%s' "$s"
+}
+
+# Экранирование строкового значения для gnuplot -e (двойные кавычки gnuplot)
+gp_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+# ----------------------------------------------------------------------------
+# Trap выхода: уборка run-каталога с учётом KEEP_TMP_ON_FAIL (FR-30)
+# ----------------------------------------------------------------------------
+RUN_DIR=""
+hm_on_exit() {
+    local rc="$1" || true
+    if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
+        if [[ "$KEEP_TMP_ON_FAIL" == "true" && "$rc" != "0" ]]; then
+            log INFO "run-каталог сохранён для разбора (KEEP_TMP_ON_FAIL=true): ${RUN_DIR}"
+        else
+            rm -rf -- "$RUN_DIR" 2>/dev/null || true
+            log INFO "run-каталог удалён: ${RUN_DIR}"
+        fi
+    fi
+    log INFO "=== heatmap: финиш (код возврата: ${rc}) ==="
+}
+trap 'hm_on_exit $?' EXIT
+
+# ----------------------------------------------------------------------------
+# FR-31: flock на LOCK_FILE; таймаут — код 4
+# ----------------------------------------------------------------------------
+mkdir -p "$TMP_BASE" || die 1 "не удалось создать ${TMP_BASE}"
+exec 9>"$LOCK_FILE" || die 1 "не удалось открыть lock-файл: ${LOCK_FILE}"
+if ! flock -w "$LOCK_WAIT_SEC" 9; then
+    log ERROR "предыдущий запуск ещё работает — лок ${LOCK_FILE} не освобождён за ${LOCK_WAIT_SEC} с"
+    exit 4
+fi
+log INFO "лок получен: ${LOCK_FILE}"
+
+# ----------------------------------------------------------------------------
+# FR-30: мусор после сбоев — run-каталоги старше 24 часов
+# ----------------------------------------------------------------------------
+while IFS= read -r stale; do
+    [[ -z "$stale" ]] && continue
+    log INFO "удаляю run-каталог старше 24 ч: ${stale}"
+    rm -rf -- "$stale" 2>/dev/null || true
+done < <(find "$TMP_BASE" -mindepth 1 -maxdepth 1 -type d -name 'run-*' -mmin +1440 -print 2>/dev/null)
+
+# ----------------------------------------------------------------------------
+# Run-каталог текущего запуска (FR-15)
+# ----------------------------------------------------------------------------
+RUN_DIR="${TMP_BASE}/run-$(date +%Y%m%d-%H%M%S)-$$"
+XY_DATA_DIR="${RUN_DIR}/XY_data"
+FRAMES_DIR="${RUN_DIR}/frames"
+STAGE_DIR="${RUN_DIR}/stage"
+mkdir -p "$XY_DATA_DIR" "$FRAMES_DIR" "$STAGE_DIR" || die 1 "не удалось создать run-каталог: ${RUN_DIR}"
+log INFO "run-каталог: ${RUN_DIR}"
+
+# ----------------------------------------------------------------------------
+# Входные данные: demoinfo (FR-8) + демка (FR-9) + DATE (FR-10)
+# ----------------------------------------------------------------------------
+if (( ${#ORIG_ARGS[@]} > 1 )); then
+    log WARN "лишние аргументы (ожидался максимум 1 — путь к demoinfo): ${ORIG_ARGS[*]:1}"
+fi
+
+DEMOINFO_SRC="${ORIG_ARGS[0]:-${DEMOINFO_FILE}}"
+if [[ -z "$DEMOINFO_SRC" ]]; then
+    die 1 "не задан demoinfo: ни аргумент \$1, ни ключ DEMOINFO_FILE в конфиге"
+fi
+if [[ ! -r "$DEMOINFO_SRC" ]]; then
+    die 2 "demoinfo не найден или не читается: ${DEMOINFO_SRC} (FR-8)"
+fi
+
+# FR-8: валидность JSON и типы обязательных полей — проверяем в основном
+# контексте (не внутри $()), чтобы сообщение об ошибке не терялось
+for _field in map mode demo date; do
+    if ! jq -e ".${_field} | select(type==\"string\")" "$DEMOINFO_SRC" >/dev/null 2>&1; then
+        die 2 "demoinfo ${DEMOINFO_SRC}: нет обязательного строкового поля '${_field}' или JSON повреждён (FR-8)"
+    fi
+done
+
+RAW_MAP="$(jq -er '.map' "$DEMOINFO_SRC")" || die 2 "demoinfo: не удалось прочитать .map (FR-8)"
+RAW_MODE="$(jq -er '.mode' "$DEMOINFO_SRC")" || die 2 "demoinfo: не удалось прочитать .mode (FR-8)"
+DEMO="$(jq -er '.demo' "$DEMOINFO_SRC")" || die 2 "demoinfo: не удалось прочитать .demo (FR-8)"
+RAW_DATE="$(jq -er '.date' "$DEMOINFO_SRC")" || die 2 "demoinfo: не удалось прочитать .date (FR-8)"
+
+DURATION="$(jq -er '.duration | select(type=="number")' "$DEMOINFO_SRC" 2>/dev/null || true)"
+if [[ -n "$DURATION" ]]; then
+    DURATION="${DURATION%%.*}"           # floor на случай дробного значения
+    is_int "$DURATION" || DURATION=0
+else
+    DURATION=0
+fi
+
+if [[ "$DEMO" != "$(basename -- "$DEMO")" || -z "$DEMO" ]]; then
+    die 2 "demoinfo: некорректное имя демки '${DEMO}' (FR-9)"
+fi
+DEMO_PATH="${DEMO_DIR}/${DEMO}"
+if [[ ! -f "$DEMO_PATH" ]]; then
+    die 2 "файл демки не найден: ${DEMO_PATH} (FR-9)"
+fi
+
+DATE="$(date +%F_%T -d "$RAW_DATE" 2>/dev/null)" || {
+    die 2 "не удалось разобрать дату партии '${RAW_DATE}' (FR-10)"
+}
+
+log INFO "партия: map='${RAW_MAP}' mode='${RAW_MODE}' demo='${DEMO}' date='${RAW_DATE}' duration=${DURATION}s"
+log INFO "demoinfo: ${DEMOINFO_SRC}; демка: ${DEMO_PATH}; DATE=${DATE}"
+
+# ----------------------------------------------------------------------------
+# Санитизация map/mode (FR-11) и имя каталога результата (FR-27)
+# ----------------------------------------------------------------------------
+MAP="$(sanitize_name "$RAW_MAP")"
+MODE="$(sanitize_name "$RAW_MODE")"
+[[ -z "$MAP" ]] && MAP="unknown_map"
+[[ -z "$MODE" ]] && MODE="unknown_mode"
+BASENAME_R="${DATE}_${MODE}_${MAP}"
+RNAME="$BASENAME_R"
+_n=2
+while [[ -e "${RESULT_DIR}/${RNAME}" || -L "${RESULT_DIR}/${RNAME}" ]]; do
+    RNAME="${BASENAME_R}-${_n}"
+    _n=$((_n + 1))
+done
+log INFO "имя каталога результата: ${RNAME}"
+
+# ----------------------------------------------------------------------------
+# Ремонт заголовка BMP (8.7.2). Найдено на реальном прогоне warfare.bsp
+# (2026-10-26): у вывода bsp2bmp поле bfSize в заголовке считается по
+# НЕпаддированной строке и biSizeImage=0. ImageMagick 6 (bmp.c
+# ReadBMPImage) на такое отвечает LengthAndFilesizeDoNotMatch: identify/
+# mogrify дают rc≠0 (mogrify -resize — без результата), композит — rc=0,
+# но с мусором в логе. Переписываем bfSize на фактический размер файла и
+# biSizeImage на фактический объём данных: изображение не меняется ни на
+# бит, но файл читается IM6 строго. Идемпотентно: корректный файл (напр.
+# utressor) не переписывается.
+# ----------------------------------------------------------------------------
+fix_bmp_header() {
+    local f="$1"
+    [[ -s "$f" ]] || return 0
+    python3 - "$f" <<'PYFIX' || return 1
+import os, struct, sys
+path = sys.argv[1]
+size = os.path.getsize(path)
+with open(path, "r+b") as fh:
+    head = fh.read(54)
+    if len(head) < 54 or head[:2] != b"BM":
+        sys.exit(0)  # не BMP — не трогаем
+    bf_size = struct.unpack_from("<I", head, 2)[0]
+    off_bits = struct.unpack_from("<I", head, 10)[0]
+    bi_size = struct.unpack_from("<I", head, 34)[0]
+    want_bf = size
+    want_bi = (size - off_bits) if 0 < off_bits < size else 0
+    if bf_size == want_bf and bi_size == want_bi:
+        sys.exit(0)
+    fh.seek(2)
+    fh.write(struct.pack("<I", want_bf))
+    fh.seek(34)
+    fh.write(struct.pack("<I", want_bi))
+    print("bfSize %d -> %d, biSizeImage %d -> %d" % (bf_size, want_bf, bi_size, want_bi))
+PYFIX
+}
+
+# ----------------------------------------------------------------------------
+# Подложка и mapinfo (FR-12/13/14, алгоритм 8.7)
+# ----------------------------------------------------------------------------
+BMP_PATH="${BLANK_MAP_DIR}/${MAP}.bmp"
+JSON_PATH="${BLANK_MAP_DIR}/${MAP}.json"
+BSP_PATH="${QW_MAP_DIR}/${MAP}.bsp"
+TOOLS_DIR="${SCRIPT_DIR}/tools"
+MAKE_MAPINFO="${TOOLS_DIR}/make_mapinfo.py"
+
+# Расчётный размер подложки из границ BSP (8.7.3): W = floor(width/scaling)
+# + 2*padding + 1. Устанавливает глобальные _RW/_RH. Вызывать ТОЛЬКО в
+# основном контексте (не внутри $( ) — die внутри под-оболочки не завершит
+# скрипт, ошибка будет молча проглочена; грабля уже ловилась на demoinfo).
+map_backdrop_dims() {
+    local _bounds _bminx _bminy _bmaxx _bmaxy
+    _bounds="$(python3 "$MAKE_MAPINFO" --bounds "$BSP_PATH")" || {
+        die 3 "make_mapinfo --bounds не удался: BSP не BSP29? инструкции по ручному созданию json — в сообщении выше и в README (FR-13)"
+    }
+    # Найдено на warfare.bsp (2026-10-26): мусорный/пустой вывод --bounds
+    # нельзя отдавать в bash-арифметику молча — пустые значения она считает
+    # нулями, и размер подложки превращался в 21x21. Жёсткая проверка формата.
+    if [[ ! "$_bounds" =~ ^-?[0-9]+[[:space:]]+-?[0-9]+[[:space:]]+-?[0-9]+[[:space:]]+-?[0-9]+$ ]]; then
+        die 3 "make_mapinfo --bounds вернул неожиданный вывод: '${_bounds}' — ожидалось 'minX minY maxX maxY' (FR-13)"
+    fi
+    read -r _bminx _bminy _bmaxx _bmaxy <<< "$_bounds"
+    if (( _bmaxx <= _bminx || _bmaxy <= _bminy )); then
+        die 3 "границы BSP некорректны: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy] — проверьте карту и MAPINFO_SCALING (FR-13)"
+    fi
+    log INFO "границы карты из BSP: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy]"
+    _RW=$(( ( _bmaxx - _bminx ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
+    _RH=$(( ( _bmaxy - _bminy ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
+    if (( _RW < 1 || _RH < 1 )); then
+        die 3 "вычислен некорректный размер подложки ${_RW}x${_RH} (проверьте MAPINFO_SCALING/границы BSP)"
+    fi
+}
+
+if [[ ! -f "$BMP_PATH" ]]; then
+    if [[ ! -f "$BSP_PATH" ]]; then
+        die 3 "нет ни подложки ${BMP_PATH}, ни исходника карты ${BSP_PATH} (FR-12)"
+    fi
+    log INFO "генерация подложки: bsp2bmp -> ${BMP_PATH}"
+    mkdir -p "$BLANK_MAP_DIR" || die 3 "не удалось создать ${BLANK_MAP_DIR}"
+    # shellcheck disable=SC2086 — BSP2BMP_ARGS намеренно разбивается на слова
+    "$BSP2BMP_BIN" $BSP2BMP_ARGS "$BSP_PATH" "$BMP_PATH" || die 3 "bsp2bmp завершился с ошибкой (FR-12)"
+    # Ремонт заголовка ДО любых операций IM (851/857 см. fix_bmp_header):
+    # свежий вывод bsp2bmp IM6 иначе не читает (mogrify -negate/-resize — rc≠0).
+    _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
+    [[ -n "$_fixr" ]] && log INFO "заголовок BMP исправлен (${_fixr}) — 8.7.2"
+    if [[ "$BLANK_MAP_NEGATE" == "true" ]]; then
+        mogrify -negate "$BMP_PATH" || die 3 "mogrify -negate не удался (FR-12/FR-37)"
+        log INFO "подложка инвертирована (mogrify -negate, BLANK_MAP_NEGATE=true)"
+    fi
+    map_backdrop_dims
+    mogrify -resize "${_RW}x${_RH}!" "$BMP_PATH" || die 3 "mogrify -resize ${_RW}x${_RH}! не удался (8.7.3)"
+    log INFO "подложка приведена к расчётному размеру ${_RW}x${_RH}"
+fi
+
+# Ремонт заголовка и для УЖЕ СУЩЕСТВОВАВШИХ подложек (в т.ч. перенесённых
+# из заготовки с тем же дефектом bfSize): делает чтение IM6 на рендере
+# чистым (без rc≠0 «по факту создания файла»). Идемпотентен.
+_fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
+[[ -n "$_fixr" ]] && log INFO "заголовок существующей подложки исправлен (${_fixr}) — 8.7.2"
+
+if [[ ! -f "$JSON_PATH" ]]; then
+    if [[ ! -f "$BSP_PATH" ]]; then
+        die 3 "нет mapinfo ${JSON_PATH} и исходника карты ${BSP_PATH} — json не сгенерировать (FR-13)"
+    fi
+    log INFO "генерация mapinfo: ${JSON_PATH}"
+    # Размер существующей подложки должен соответствовать формуле 8.7.3.
+    # Найдено на warfare (2026-10-26): неоконченный прогон сервера оставил
+    # в blank_map RAW-вывод bsp2bmp 1903x1903 — без этого выравнивания json
+    # зафиксировал бы неверные imageWidth/imageHeight и рендер уехал бы.
+    map_backdrop_dims
+    _dims="$(identify -format '%w %h' "$BMP_PATH" 2>/dev/null)" || _dims=""
+    if [[ "$_dims" != "${_RW} ${_RH}" ]]; then
+        log INFO "размер подложки ${_dims:-неизвестен} не совпадает с расчётным ${_RW}x${_RH} — привожу (8.7.3)"
+        mogrify -resize "${_RW}x${_RH}!" "$BMP_PATH" || die 3 "mogrify -resize ${_RW}x${_RH}! не удался (8.7.3)"
+        log INFO "подложка приведена к расчётному размеру ${_RW}x${_RH}"
+    fi
+    python3 "$MAKE_MAPINFO" "$BMP_PATH" "$BSP_PATH" \
+        --padding "$MAPINFO_PADDING" --scaling "$MAPINFO_SCALING" \
+        --output "$JSON_PATH" || {
+        die 3 "make_mapinfo.py не удался — если BSP не BSP29, создайте json вручную (инструкция в README, FR-13)"
+    }
+fi
+
+# FR-14: проверка согласованности размеров bmp и json
+BMP_W="$(identify -format '%w' "$BMP_PATH" 2>/dev/null || true)"
+BMP_H="$(identify -format '%h' "$BMP_PATH" 2>/dev/null || true)"
+IMG_WIDTH="$(jq -er '.imageWidth | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля imageWidth"
+IMG_HEIGHT="$(jq -er '.imageHeight | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля imageHeight"
+if [[ -n "$BMP_W" && "$BMP_W" != "$IMG_WIDTH" ]] || [[ -n "$BMP_H" && "$BMP_H" != "$IMG_HEIGHT" ]]; then
+    log WARN "размеры bmp ${BMP_W}x${BMP_H} не совпадают с mapinfo ${IMG_WIDTH}x${IMG_HEIGHT} — продолжаю с размерами json (FR-14)"
+fi
+if identify "$BMP_PATH" >/dev/null 2>&1; then BMP_QUIRK=0; else BMP_QUIRK=1; fi
+if (( BMP_QUIRK == 1 )); then
+    log INFO "bmp имеет некорректное поле размера в заголовке (известная особенность исходных подложек); IM6 при этом возвращает ненулевой код — принимаю кадры по факту создания файла"
+fi
+
+# параметры рендера из mapinfo (8.1.7 — соответствие референсу test.sh)
+PADDING="$(jq -er '.padding | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля padding"
+SCALING="$(jq -er '.scaling | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля scaling"
+MIN_X="$(jq -r '.minX/.scaling' "$JSON_PATH")"
+MAX_X="$(jq -r '.maxX/.scaling' "$JSON_PATH")"
+MAX_Y="$(jq -r '.minY/.scaling*-1' "$JSON_PATH")"
+MIN_Y="$(jq -r '.maxY/.scaling*-1' "$JSON_PATH")"
+if ! is_num "$PADDING"; then die 3 "mapinfo: padding='${PADDING}' не число"; fi
+if ! is_num "$SCALING"; then die 3 "mapinfo: scaling='${SCALING}' не число"; fi
+if ! awk -v s="$SCALING" 'BEGIN{exit !(s>0)}'; then die 3 "mapinfo: scaling должен быть > 0"; fi
+log INFO "рендер: ${IMG_WIDTH}x${IMG_HEIGHT}, padding=${PADDING}, scaling=${SCALING}, X[${MIN_X}:${MAX_X}] Y[${MIN_Y}:${MAX_Y}]"
+
+# ----------------------------------------------------------------------------
+# Стартовая gnuplot-проба (FR-36): мини-рендер с настроенной палитрой/маркерами
+# ----------------------------------------------------------------------------
+PROBE_DIR="${RUN_DIR}/probe"
+mkdir -p "$PROBE_DIR"
+printf '0 0 0 5\n10 0 0 2\n-10 0 0 5\n' > "${PROBE_DIR}/probe.data"
+_GNUPLOT_VARS="HM_DATA_FILE=$(gp_str "${PROBE_DIR}/probe.data")"
+_GNUPLOT_VARS+="; HM_OUT_DIR=$(gp_str "$PROBE_DIR")"
+_GNUPLOT_VARS+="; HM_NAME=$(gp_str "probe"); HM_FRAME=0; HM_EVERY=\"\""
+_GNUPLOT_VARS+="; HM_MIN_X=-20; HM_MAX_X=20; HM_MIN_Y=-20; HM_MAX_Y=20"
+_GNUPLOT_VARS+="; HM_MIN_Z=-1; HM_MAX_Z=1; HM_IMG_WIDTH=64; HM_IMG_HEIGHT=64"
+_GNUPLOT_VARS+="; HM_PADDING=1; HM_SCALING=1"
+_GNUPLOT_VARS+="; HM_PS_MOVE=${MARKER_MOVE_SIZE}; HM_PS_DEATH=${MARKER_DEATH_SIZE}"
+_GNUPLOT_VARS+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYPE}"
+_GNUPLOT_VARS+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
+_GNUPLOT_VARS+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
+_GNUPLOT_VARS+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
+if ! gnuplot -e "$_GNUPLOT_VARS" "$GNUPLOT_SCRIPT" 2> "${PROBE_DIR}/probe.err"; then
+    log ERROR "стартовая gnuplot-проба не прошла — проверьте PALETTE_*/MARKER_* в конфиге (FR-36):"
+    sed 's/^/    /' "${PROBE_DIR}/probe.err" 2>/dev/null || true
+    die 1 "невалидная палитра/маркеры в конфиге (FR-36, код 1)"
+fi
+log INFO "стартовая gnuplot-проба: OK (палитра и маркеры валидны)"
+
+# ----------------------------------------------------------------------------
+# Парсинг демки (FR-15/16/17) — таймер этапа "парсинг"
+# ----------------------------------------------------------------------------
+T_START=$(date +%s)
+T_PARSE_MS=0; T_FRAMES_MS=0; T_GIF_MS=0
+_t0=$(date +%s%3N)
+
+TEMPLATE_DAT="${RUN_DIR}/template.dat"
+sed "s|@@XY_DATA_DIR@@|${XY_DATA_DIR}|g" "$TEMPLATE_TPL" > "$TEMPLATE_DAT" || {
+    die 3 "не удалось сгенерировать template.dat из ${TEMPLATE_TPL} (FR-16)"
+}
+if grep -q '@@XY_DATA_DIR@@' "$TEMPLATE_DAT"; then
+    die 3 "template.dat: плейсхолдер @@XY_DATA_DIR@@ не заменён (FR-16)"
+fi
+log INFO "template.dat сгенерирован: ${TEMPLATE_DAT}"
+
+# симлинк демки (или копия при ошибке линковки)
+ln -s -- "$DEMO_PATH" "${RUN_DIR}/last.mvd" 2>/dev/null || {
+    cp -- "$DEMO_PATH" "${RUN_DIR}/last.mvd" || die 3 "не удалось линковать/скопировать демку (FR-15)"
+}
+
+# mvdparser пишет по абсолютному пути из template.dat (8.6).
+# ВАЖНО (подводный камень, проверено на бинарнике): mvdparser молча НЕ
+# открывает демку по абсолютному пути — работает только относительный.
+# Поэтому запускаем из SCRIPT_DIR с относительными путями всех аргументов.
+REL_DEMO="$(realpath --relative-to="$SCRIPT_DIR" "${RUN_DIR}/last.mvd")"
+REL_FRAG="$(realpath --relative-to="$SCRIPT_DIR" "$FRAGFILE")"
+REL_TPL="$(realpath --relative-to="$SCRIPT_DIR" "$TEMPLATE_DAT")"
+REL_BIN="$(realpath --relative-to="$SCRIPT_DIR" "$MVDPARSER_BIN")"
+[[ "$REL_BIN" == */* ]] || REL_BIN="./${REL_BIN}"
+( cd "$SCRIPT_DIR" && \
+    "$REL_BIN" -f "$REL_FRAG" -t "$REL_TPL" "$REL_DEMO" ) || {
+    die 3 "mvdparser завершился с ошибкой (FR-17)"
+}
+
+shopt -s nullglob
+data_files=("${XY_DATA_DIR}"/*.data)
+shopt -u nullglob
+if (( ${#data_files[@]} == 0 )); then
+    die 3 "mvdparser не создал ни одного .data в ${XY_DATA_DIR} (FR-17)"
+fi
+log INFO "mvdparser: ${#data_files[@]} файл(ов) координат"
+
+_t1=$(date +%s%3N); T_PARSE_MS=$((_t1 - _t0))
+
+# ----------------------------------------------------------------------------
+# MIN_Z / MAX_Z (8.4): общая шкала высоты, поведение как в референсе.
+# Реплицируется конвейер `cut|grep -oP "^[-\d]+"|sort -n|uniq -c|
+# grep -oP "\d{2,} \d+"`:
+#   * выживает значение со счётчиком >= Z_OUTLIER_MIN_COUNT (10 -> "\d{2,}");
+#   * значение должно быть НЕОТРИЦАТЕЛЬНЫМ ("\d+" после пробела не матчит
+#     знак минус) — побочный эффект regex референса, обязателен для
+#     визуальной эквивалентности палитры (NFR-5, T-1);
+#   * если после фильтра пусто — без фильтра (8.4.3);
+#   * MIN == MAX -> расширить на 1 (8.4.4).
+# ----------------------------------------------------------------------------
+z_range_awk() {
+    # $1 = MINC (Z_OUTLIER_MIN_COUNT); $2.. = файлы .data
+    awk -v MINC="$1" '
+        {
+            z = $3
+            if (match(z, /^[-]?[0-9]+/)) { z = substr(z, RSTART, RLENGTH) } else { next }
+            n = z + 0
+            if (!all_set) { all_min = n; all_max = n; all_set = 1 }
+            else { if (n < all_min) all_min = n; if (n > all_max) all_max = n }
+            if (z !~ /^[0-9]+$/) next          # реплика "\d+ \d+": без минуса
+            cnt[n]++
+        }
+        END {
+            if (!all_set) { print "ERR"; exit }
+            mn = ""; mx = ""
+            for (k in cnt) {
+                if (cnt[k] < MINC) continue
+                v = k + 0
+                if (mn == "" || v < mn) mn = v
+                if (mx == "" || v > mx) mx = v
+            }
+            if (mn == "") { mn = all_min; mx = all_max }   # 8.4.3
+            if (mn == mx) { mn = mn - 1; mx = mx + 1 }      # 8.4.4
+            printf "%s %s\n", mn, mx
+        }
+    ' "${@:2}"
+}
+
+ZRANGE="$(z_range_awk "${Z_OUTLIER_MIN_COUNT:-10}" ${data_files[@]+"${data_files[@]}"})"
+if [[ "$ZRANGE" == "ERR" || -z "$ZRANGE" ]]; then
+    die 3 "не удалось вычислить MIN_Z/MAX_Z: нет корректных Z-значений в .data (8.4)"
+fi
+read -r MIN_Z MAX_Z <<< "$ZRANGE"
+log INFO "шкала высот: MIN_Z=${MIN_Z} MAX_Z=${MAX_Z} (Z_OUTLIER_MIN_COUNT=${Z_OUTLIER_MIN_COUNT})"
+
+# ----------------------------------------------------------------------------
+# Передача параметров в gnuplot (8.8.1): только слоты и числа (FR-20)
+# ----------------------------------------------------------------------------
+GNUPLOT_BASE="HM_MIN_X=${MIN_X}; HM_MAX_X=${MAX_X}; HM_MIN_Y=${MIN_Y}; HM_MAX_Y=${MAX_Y}"
+GNUPLOT_BASE+="; HM_MIN_Z=${MIN_Z}; HM_MAX_Z=${MAX_Z}"
+GNUPLOT_BASE+="; HM_IMG_WIDTH=${IMG_WIDTH}; HM_IMG_HEIGHT=${IMG_HEIGHT}"
+GNUPLOT_BASE+="; HM_PADDING=${PADDING}; HM_SCALING=${SCALING}"
+GNUPLOT_BASE+="; HM_PS_MOVE=${MARKER_MOVE_SIZE}; HM_PS_DEATH=${MARKER_DEATH_SIZE}"
+GNUPLOT_BASE+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYPE}"
+GNUPLOT_BASE+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
+GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
+GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
+
+# ----------------------------------------------------------------------------
+# Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"
+# ----------------------------------------------------------------------------
+: > "${STAGE_DIR}/players.txt"
+declare -A USED_NAMES=()
+SLOT_NUM=0
+GIF_COUNT=0
+
+for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
+    RAW_NICK="$(basename -- "$DATA_FILE" .data)"
+    SLOT_NUM=$((SLOT_NUM + 1))
+    SLOT="$(printf 'p%03d' "$SLOT_NUM")"
+
+    # санитизация ника (8.5) + пусто -> player_<слот>
+    NICK_S="$(sanitize_name "$RAW_NICK")"
+    if [[ -z "$NICK_S" ]]; then NICK_S="player_${SLOT}"; fi
+    # коллизии имён внутри партии (8.5.5 / FR-25)
+    CAND="$NICK_S"; _k=2
+    while [[ -n "${USED_NAMES[$CAND]:-}" ]]; do
+        CAND="${NICK_S}_${_k}"
+        _k=$((_k + 1))
+    done
+    NICK_S="$CAND"
+    USED_NAMES["$NICK_S"]=1
+
+    log INFO "игрок ${SLOT}: ник '${RAW_NICK}' -> имя результата '${NICK_S}'"
+
+    # FR-19: минимум строк
+    LINES_ALL="$(awk 'END{print NR}' "$DATA_FILE")"
+    if (( LINES_ALL < MIN_DATA_LINES )); then
+        log WARN "игрок ${SLOT} ('${RAW_NICK}'): строк ${LINES_ALL} < MIN_DATA_LINES=${MIN_DATA_LINES} — пропущен (FR-19)"
+        continue
+    fi
+    # L — число точек данных, как их нумерует gnuplot every (пустые строки
+    # и мусорные строки точками не являются — проверено на gnuplot 5.4)
+    L="$(awk '$1 ~ /^[-+]?[0-9]/ {c++} END{print c+0}' "$DATA_FILE")"
+    if (( L == 0 )); then
+        log WARN "игрок ${SLOT} ('${RAW_NICK}'): нет строк данных — пропущен (FR-19)"
+        continue
+    fi
+
+    # число кадров (8.2/8.3)
+    if [[ "$GIF_MODE" == "chunks" ]]; then
+        if (( DURATION > 0 )); then
+            NUM=$(( (DURATION + CHUNK_SECONDS - 1) / CHUNK_SECONDS ))
+            if (( NUM > MAX_FRAMES_CAP )); then
+                log INFO "число кусков ${NUM} > MAX_FRAMES_CAP=${MAX_FRAMES_CAP} — ограничено"
+                NUM=$MAX_FRAMES_CAP
+            fi
+        else
+            NUM=$MAX_FRAMES
+            log INFO "duration отсутствует/нулевой — fallback MAX_FRAMES=${MAX_FRAMES} (8.3, T-5)"
+        fi
+    else
+        NUM=$MAX_FRAMES
+    fi
+    if (( NUM > L )); then NUM=$L; fi
+    if (( NUM < 1 )); then
+        log WARN "игрок ${SLOT} ('${RAW_NICK}'): 0 кадров — пропущен"
+        continue
+    fi
+    log INFO "игрок ${SLOT}: строк данных L=${L}, кадров NUM=${NUM}, режим ${GIF_MODE}"
+
+    PDIR="${FRAMES_DIR}/${SLOT}"
+    mkdir -p "$PDIR"
+    FRAME_OK=0
+    _pf0=$(date +%s%3N)
+
+    for (( f = 0; f < NUM; f++ )); do
+        if [[ "$GIF_MODE" == "chunks" ]]; then
+            FSTART=$(( f * L / NUM ))
+            FEND=$(( (f + 1) * L / NUM - 1 ))
+            EVERY="every 1::${FSTART}::${FEND}"
+        else
+            EVERY="every ${NUM}::${f}"
+        fi
+        FRAME_BASE="${PDIR}/${SLOT}$(printf '%03d' "$f")"
+
+        _GV="${GNUPLOT_BASE}; HM_DATA_FILE=$(gp_str "$DATA_FILE")"
+        _GV+="; HM_OUT_DIR=$(gp_str "$PDIR")"
+        _GV+="; HM_NAME=$(gp_str "$SLOT"); HM_FRAME=${f}; HM_EVERY=$(gp_str "$EVERY")"
+
+        if ! gnuplot -e "$_GV" "$GNUPLOT_SCRIPT" 2> "${PDIR}/gnuplot.err"; then
+            log WARN "игрок ${SLOT}: кадр $((f + 1))/${NUM} — сбой gnuplot, кадр пропущен (FR-24)"
+            continue
+        fi
+        if [[ ! -s "${FRAME_BASE}.png" ]]; then
+            log WARN "игрок ${SLOT}: кадр $((f + 1))/${NUM} — gnuplot не создал файл, кадр пропущен (FR-24)"
+            continue
+        fi
+        # FR-22: наложение без -trim (кадры обязаны иметь одинаковое полотно)
+        composite "${FRAME_BASE}.png" "$BMP_PATH" "${FRAME_BASE}_map.png" 2>> "${PDIR}/composite.err" || true
+        if [[ ! -s "${FRAME_BASE}_map.png" ]]; then
+            log WARN "игрок ${SLOT}: кадр $((f + 1))/${NUM} — сбой composite, кадр пропущен (FR-24)"
+            continue
+        fi
+        FRAME_OK=$((FRAME_OK + 1))
+    done
+
+    _pf1=$(date +%s%3N); T_FRAMES_MS=$((T_FRAMES_MS + _pf1 - _pf0))
+
+    # FR-24: успешно менее половины кадров — GIF не собирается
+    if (( FRAME_OK * 2 < NUM )); then
+        log WARN "игрок ${SLOT} ('${RAW_NICK}'): успешных кадров ${FRAME_OK} из ${NUM} (< половины) — GIF не собирается (FR-24)"
+        continue
+    fi
+
+    _pg0=$(date +%s%3N)
+    GIF_NAME="${NICK_S}.gif"
+    # FR-23: сборка GIF (лексикографический порядок кадров — 3-значный паддинг)
+    if ! convert -delay "$GIF_DELAY_CS" -loop "$GIF_LOOP" \
+            "${PDIR}/${SLOT}"*"_map.png" "${STAGE_DIR}/${GIF_NAME}" 2>> "${PDIR}/convert.err"; then
+        if [[ ! -s "${STAGE_DIR}/${GIF_NAME}" ]]; then
+            log WARN "игрок ${SLOT} ('${RAW_NICK}'): сбой convert — GIF пропущен (FR-24)"
+            rm -f -- "${STAGE_DIR}/${GIF_NAME}"
+            continue
+        fi
+        log INFO "convert вернул ненулевой код, GIF создан — принят"
+    fi
+    # оптимизация GIF (FR-23); сбой оптимизации не фатален
+    if ! mogrify -layers 'optimize' -fuzz "${GIF_OPTIMIZE_FUZZ}%" "${STAGE_DIR}/${GIF_NAME}" 2>> "${PDIR}/convert.err"; then
+        log WARN "игрок ${SLOT}: сбой mogrify -layers optimize — оставляю GIF без оптимизации"
+    fi
+    _pg1=$(date +%s%3N); T_GIF_MS=$((T_GIF_MS + _pg1 - _pg0))
+
+    GSIZE="$(stat -c%s "${STAGE_DIR}/${GIF_NAME}" 2>/dev/null || echo 0)"
+    printf '%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" >> "${STAGE_DIR}/players.txt"
+    GIF_COUNT=$((GIF_COUNT + 1))
+    log INFO "игрок ${SLOT}: GIF готов: ${GIF_NAME} (${GSIZE} байт, кадров ${FRAME_OK}/${NUM}, время $(( (_pg1 - _pf0 + 500) / 1000 )) с)"
+done
+
+if (( GIF_COUNT == 0 )); then
+    log ERROR "ни для одного игрока не построен GIF — публикация не выполняется"
+    log INFO "тайминги: парсинг $((T_PARSE_MS / 1000)).$(((T_PARSE_MS % 1000) / 100))с, кадры $((T_FRAMES_MS / 1000)).$(((T_FRAMES_MS % 1000) / 100))с, сборка GIF $((T_GIF_MS / 1000)).$(((T_GIF_MS % 1000) / 100))с"
+    exit 3
+fi
+
+# ----------------------------------------------------------------------------
+# Публикация (FR-26/27): атомарный mv staging -> result/
+# ----------------------------------------------------------------------------
+# копия demoinfo для провенанса
+cp -- "$DEMOINFO_SRC" "${STAGE_DIR}/demoinfo.json" || die 3 "не удалось скопировать demoinfo в staging (FR-26)"
+
+mkdir -p "$RESULT_DIR" || die 3 "не удалось создать ${RESULT_DIR}"
+# повторная проверка уникальности имени непосредственно перед публикацией
+RNAME="$BASENAME_R"
+_n=2
+while [[ -e "${RESULT_DIR}/${RNAME}" || -L "${RESULT_DIR}/${RNAME}" ]]; do
+    RNAME="${BASENAME_R}-${_n}"
+    _n=$((_n + 1))
+done
+if ! mv -- "${STAGE_DIR}" "${RESULT_DIR}/${RNAME}"; then
+    die 3 "публикация не удалась: mv ${STAGE_DIR} -> ${RESULT_DIR}/${RNAME} (FR-26)"
+fi
+TOTAL_SIZE="$(du -sb "${RESULT_DIR}/${RNAME}" 2>/dev/null | awk '{print $1}')"
+log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players.txt: $(wc -l < "${RESULT_DIR}/${RNAME}/players.txt") строк)"
+
+# ----------------------------------------------------------------------------
+# Ретеншн результатов (FR-28) и логов (FR-29)
+# ----------------------------------------------------------------------------
+RESULT_PAT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]:[0-9][0-9]:[0-9][0-9]_.+'
+
+# (а) по возрасту mtime
+while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    log INFO "ретеншн: удаляю каталог результата (возраст > ${RETENTION_MAX_AGE_DAYS} сут): ${d}"
+    rm -rf -- "$d" 2>/dev/null || log WARN "ретеншн: не удалось удалить ${d}"
+done < <(find "$RESULT_DIR" -mindepth 1 -maxdepth 1 -type d \
+            -regextype posix-extended -regex ".*/${RESULT_PAT}" \
+            -mtime "+${RETENTION_MAX_AGE_DAYS}" -print 2>/dev/null)
+
+# (б) по количеству: удаляются старейшие, пока не уложимся в RETENTION_MAX_DIRS
+_dir_count="$(find "$RESULT_DIR" -mindepth 1 -maxdepth 1 -type d \
+                  -regextype posix-extended -regex ".*/${RESULT_PAT}" -print 2>/dev/null | wc -l)"
+if (( _dir_count > RETENTION_MAX_DIRS )); then
+    _excess=$((_dir_count - RETENTION_MAX_DIRS))
+    log INFO "ретеншн: каталогов результата ${_dir_count} > RETENTION_MAX_DIRS=${RETENTION_MAX_DIRS} — удаляю старейшие (${_excess} шт.)"
+    while IFS= read -r d; do
+        if (( _excess <= 0 )); then break; fi
+        log INFO "ретеншн: удаляю старейший каталог результата: ${d}"
+        rm -rf -- "$d" 2>/dev/null || log WARN "ретеншн: не удалось удалить ${d}"
+        _excess=$((_excess - 1))
+    done < <(find "$RESULT_DIR" -mindepth 1 -maxdepth 1 -type d \
+                 -regextype posix-extended -regex ".*/${RESULT_PAT}" \
+                 -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+fi
+
+# логи старше LOG_RETENTION_DAYS суток
+while IFS= read -r lf; do
+    [[ -z "$lf" ]] && continue
+    log INFO "ретеншн: удаляю старый лог (${LOG_RETENTION_DAYS} сут): ${lf}"
+    rm -f -- "$lf" 2>/dev/null || true
+done < <(find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -name 'heatmap-*.log' \
+             -mtime "+${LOG_RETENTION_DAYS}" -print 2>/dev/null)
+
+# ----------------------------------------------------------------------------
+# Финиш (FR-33): общее время и поэтапные тайминги
+# ----------------------------------------------------------------------------
+T_END=$(date +%s)
+_fmt_ms() { echo "$(($1 / 1000)).$(($1 % 1000 / 100))"; }
+log INFO "тайминги: всего $((T_END - T_START)) с; парсинг $( _fmt_ms "$T_PARSE_MS")с; кадры $( _fmt_ms "$T_FRAMES_MS")с; сборка GIF $( _fmt_ms "$T_GIF_MS")с"
+log INFO "итог: результат result/${RNAME}, GIF ${GIF_COUNT}, игроков обработано ${SLOT_NUM}"
+
+exit 0
+
