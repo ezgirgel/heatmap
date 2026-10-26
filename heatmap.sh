@@ -62,6 +62,21 @@ fi
 source "$CONFIG"
 
 # ----------------------------------------------------------------------------
+# Раскладка инструментов (v1.0.4): бинарники поставки лежат в tools/. Для
+# совместимости со старыми установками (файлы в корне рядом со скриптом)
+# путь выбирается по факту наличия файла: tools/ приоритетен, корень — фолбэк.
+# Явно заданные в конфиге/окружении MVDPARSER_BIN/BSP2BMP_BIN приоритетнее.
+# ----------------------------------------------------------------------------
+_hm_tool_path() {
+    local _name="$1"
+    if [[ -e "${SCRIPT_DIR}/tools/${_name}" ]]; then
+        printf '%s\n' "${SCRIPT_DIR}/tools/${_name}"
+    else
+        printf '%s\n' "${SCRIPT_DIR}/${_name}"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Дефолты раздела 7 (FR-7): запуск без части ключей не падает, если ключ
 # не обязателен. Обязательные: QW_MAP_DIR, DEMO_DIR, DEMOINFO_FILE.
 # ----------------------------------------------------------------------------
@@ -72,11 +87,12 @@ source "$CONFIG"
 : "${RESULT_DIR:=${SCRIPT_DIR}/result}"
 : "${LOG_DIR:=${SCRIPT_DIR}/logs}"
 : "${TMP_BASE:=${SCRIPT_DIR}/tmp}"
-: "${MVDPARSER_BIN:=${SCRIPT_DIR}/mvdparser}"
+: "${TOOLS_DIR:=${SCRIPT_DIR}/tools}"
+: "${MVDPARSER_BIN:=$(_hm_tool_path mvdparser)}"
 : "${FRAGFILE:=${SCRIPT_DIR}/fragfile.dat}"
 : "${TEMPLATE_TPL:=${SCRIPT_DIR}/template.tpl}"
 : "${GNUPLOT_SCRIPT:=${SCRIPT_DIR}/xy.gnuplot}"
-: "${BSP2BMP_BIN:=${SCRIPT_DIR}/bsp2bmp_3800}"
+: "${BSP2BMP_BIN:=$(_hm_tool_path bsp2bmp_3800)}"
 : "${BSP2BMP_ARGS:=-s4 -z0 -p0 -e -c+Z}"
 : "${LOCK_FILE:=${TMP_BASE}/heatmap.lock}"
 
@@ -96,7 +112,7 @@ source "$CONFIG"
 : "${MARKER_MOVE_SIZE:=5}"
 : "${MARKER_DEATH_TYPE:=2}"
 : "${MARKER_DEATH_SIZE:=2}"
-: "${BLANK_MAP_NEGATE:=true}"
+: "${BLANK_MAP_NEGATE:=false}"
 : "${Z_OUTLIER_MIN_COUNT:=10}"
 : "${MAPINFO_PADDING:=10}"
 : "${MAPINFO_SCALING:=4}"
@@ -183,7 +199,7 @@ check_unknown_keys() {
         BLANK_MAP_DIR BLANK_MAP_NEGATE
         MVDPARSER_BIN FRAGFILE TEMPLATE_TPL GNUPLOT_SCRIPT
         BSP2BMP_BIN BSP2BMP_ARGS
-        RESULT_DIR LOG_DIR TMP_BASE LOCK_FILE
+        RESULT_DIR LOG_DIR TMP_BASE LOCK_FILE TOOLS_DIR
         GIF_MODE CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES
         GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
@@ -461,7 +477,7 @@ PYFIX
 BMP_PATH="${BLANK_MAP_DIR}/${MAP}.bmp"
 JSON_PATH="${BLANK_MAP_DIR}/${MAP}.json"
 BSP_PATH="${QW_MAP_DIR}/${MAP}.bsp"
-TOOLS_DIR="${SCRIPT_DIR}/tools"
+TOOLS_DIR="${TOOLS_DIR:-${SCRIPT_DIR}/tools}"
 MAKE_MAPINFO="${TOOLS_DIR}/make_mapinfo.py"
 
 # Расчётный размер подложки из границ BSP (8.7.3): W = floor(width/scaling)
@@ -484,6 +500,8 @@ map_backdrop_dims() {
         die 3 "границы BSP некорректны: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy] — проверьте карту и MAPINFO_SCALING (FR-13)"
     fi
     log INFO "границы карты из BSP: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy]"
+    # Границы наружу (глобальные) — для кросс-проверки с Bounds bsp2bmp (v1.0.3)
+    _G_BXMIN="$_bminx"; _G_BYMIN="$_bminy"; _G_BXMAX="$_bmaxx"; _G_BYMAX="$_bmaxy"
     _RW=$(( ( _bmaxx - _bminx ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
     _RH=$(( ( _bmaxy - _bminy ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
     if (( _RW < 1 || _RH < 1 )); then
@@ -498,7 +516,29 @@ if [[ ! -f "$BMP_PATH" ]]; then
     log INFO "генерация подложки: bsp2bmp -> ${BMP_PATH}"
     mkdir -p "$BLANK_MAP_DIR" || die 3 "не удалось создать ${BLANK_MAP_DIR}"
     # shellcheck disable=SC2086 — BSP2BMP_ARGS намеренно разбивается на слова
-    "$BSP2BMP_BIN" $BSP2BMP_ARGS "$BSP_PATH" "$BMP_PATH" || die 3 "bsp2bmp завершился с ошибкой (FR-12)"
+    # Вывод захватывается (v1.0.3): строка Bounds нужна кросс-проверке границ;
+    # сам вывод полностью печатается в лог, как и раньше.
+    _bspout="$("$BSP2BMP_BIN" $BSP2BMP_ARGS "$BSP_PATH" "$BMP_PATH" 2>&1)" || {
+        printf '%s\n' "${_bspout:-<нет вывода>}" >&2
+        die 3 "bsp2bmp завершился с ошибкой (FR-12)"
+    }
+    printf '%s\n' "$_bspout" >&2
+    # Bounds из вывода bsp2bmp (считает по вершинам VERTEXES — путь,
+    # независимый от каталога lump'ов). Формат: «Bounds: X [-480.0000 ..
+    # 928.0000] …» + строка продолжения «        Y [-752.0000 .. 832.0000] …».
+    # Ось Y в выводе bsp2bmp — ИЗОБРАЖЕНИЯ (вниз), т.е. инвертирована
+    # относительно мировых координат: проверено на эталонных json прода
+    # (utressor: bsp2bmp Y[-528..416] ↔ json minY/maxY -416/528; travelert6
+    # аналогично), поэтому мировые границы = (-y_max, -y_min).
+    _bsp_bounds="$(printf '%s\n' "$_bspout" | awk '
+        /^Bounds:/ { for (i = 2; i <= NF; i++) if ($i == "X") {
+            x1 = $(i+1); x2 = $(i+3); gsub(/[\[\]]/, "", x1); gsub(/[\[\]]/, "", x2) }
+        }
+        /^[[:space:]]*Y[[:space:]]*\[/ { y1 = $2; y2 = $4;
+            gsub(/[\[\]]/, "", y1); gsub(/[\[\]]/, "", y2) }
+        END { if (x1 != "" && x2 != "" && y1 != "" && y2 != "")
+            printf "%.0f %.0f %.0f %.0f\n", x1, x2, -y2, -y1 }
+    ')"
     # Ремонт заголовка ДО любых операций IM (851/857 см. fix_bmp_header):
     # свежий вывод bsp2bmp IM6 иначе не читает (mogrify -negate/-resize — rc≠0).
     _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
@@ -508,6 +548,19 @@ if [[ ! -f "$BMP_PATH" ]]; then
         log INFO "подложка инвертирована (mogrify -negate, BLANK_MAP_NEGATE=true)"
     fi
     map_backdrop_dims
+    # Кросс-проверка границ (v1.0.3, FR-13): dmodel[0] из каталога lump'ов
+    # против вершин, по которым bsp2bmp рендерил подложку. Урок warfare.bsp:
+    # неверный индекс MODELS в каталоге давал правдоподобные нули молча,
+    # а расхождение здесь означало бы сдвиг/масштаб маркеров на рендере.
+    if [[ -n "${_bsp_bounds:-}" ]]; then
+        read -r _bb_xmin _bb_xmax _bb_ymin _bb_ymax <<< "$_bsp_bounds"
+        if (( _bb_xmin != _G_BXMIN || _bb_xmax != _G_BXMAX || _bb_ymin != _G_BYMIN || _bb_ymax != _G_BYMAX )); then
+            die 3 "кросс-проверка границ не сошлась: dmodel[0] X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] против вершин bsp2bmp X[$_bb_xmin..$_bb_xmax] Y[$_bb_ymin..$_bb_ymax] — привязка координат была бы неверной (FR-13)"
+        fi
+        log INFO "кросс-проверка границ: dmodel[0] == вершины bsp2bmp, X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] — OK (FR-13)"
+    else
+        log WARN "Bounds не найдены в выводе bsp2bmp — кросс-проверка границ пропущена (FR-13)"
+    fi
     mogrify -resize "${_RW}x${_RH}!" "$BMP_PATH" || die 3 "mogrify -resize ${_RW}x${_RH}! не удался (8.7.3)"
     log INFO "подложка приведена к расчётному размеру ${_RW}x${_RH}"
 fi

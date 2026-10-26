@@ -31,14 +31,21 @@ import sys
 
 BSP_HEADER_SIZE = 4          # int32 version
 BSP_LUMP_ENTRY_SIZE = 8      # int32 fileofs, int32 filelen
-# ВНИМАНИЕ (найдено на реальном прогоне warfare.bsp 2026-10-26): в BSP29
-# MODELS — lump 13, а 11 — EDGES. Ранее здесь стояло 11, из-за чего парсер
-# читал первые байты EDGES как bbox (мусорные float32 -> "0 0 0 0" ->
-# mogrify -resize 21x21! на сервере). Синтетические BSP старого генератора
-# были собраны с той же ошибкой, поэтому T-8 самосогласованно проходил.
-BSP_LUMP_MODELS = 13         # индекс lump'а MODELS в BSP29 (0-based, qbsp)
+# Каталог BSP29 — ровно 15 именованных lump'ов (канон: id Software,
+# WinQuake/bspfile.h; подтверждено Unofficial Quake Spec 3.4 и реальными
+# размерами lump'ов warfare.bsp: VERTEXES 43884=3657*12, FACES 52640=2632*20,
+# EDGES 27016=6754*4, SURFEDGES 53640=26820*4):
+#   0 ENTITIES, 1 PLANES, 2 TEXTURES, 3 VERTEXES, 4 VISIBILITY, 5 NODES,
+#   6 TEXINFO, 7 FACES, 8 LIGHTING, 9 CLIPNODES, 10 LEAFS, 11 MARKSURFACES,
+#   12 EDGES, 13 SURFEDGES, 14 MODELS; HEADER_LUMPS = 15.
+# История дефекта (warfare.bsp, реальные прогоны 2026-10-26/27): ТЗ 8.7.2
+# предписывало индекс 11 (= MARKSURFACES → float32-денормалы «0 0 0 0» →
+# подложка 21x21); «фикс» v1.0.2 ставил 13 (= SURFEDGES → те же нули,
+# валидация ofs/len при этом проходила). Канонический индекс MODELS — 14.
+BSP_LUMP_MODELS = 14
 BSP_LUMP_COUNT = 15
 
+DMODEL_T_SIZE = 64           # sizeof(dmodel_t) BSP29 (см. bspfile.h)
 DMODEL_BOUNDS_SIZE = 24      # float32 mins[3] + float32 maxs[3]
 
 BSP2_MAGICS = (b"2PSB", b"BSP2")
@@ -90,20 +97,54 @@ def parse_bsp29_bounds(bsp_path: str):
     lump_ofs, lump_len = struct.unpack_from(
         "<ii", head, BSP_HEADER_SIZE + BSP_LUMP_MODELS * BSP_LUMP_ENTRY_SIZE
     )
-    if lump_ofs <= 0 or lump_len < DMODEL_BOUNDS_SIZE or lump_ofs + DMODEL_BOUNDS_SIZE > size:
+    if lump_ofs <= 0 or lump_len < DMODEL_T_SIZE or lump_ofs + lump_len > size:
         fail(
-            "BSP '%s': некорректный lump MODELS (ofs=%d, len=%d)"
-            % (bsp_path, lump_ofs, lump_len)
+            "BSP '%s': некорректный lump MODELS (ofs=%d, len=%d) — файл не "
+            "похож на BSP29 или повреждён. %s"
+            % (bsp_path, lump_ofs, lump_len, MANUAL_JSON_HINT)
         )
+    if lump_len % DMODEL_T_SIZE != 0:
+        fail(
+            "BSP '%s': длина lump MODELS (%d) не кратна sizeof(dmodel_t)=%d "
+            "— неверная версия формата. %s"
+            % (bsp_path, lump_len, DMODEL_T_SIZE, MANUAL_JSON_HINT)
+        )
+    nummodels = lump_len // DMODEL_T_SIZE
 
     with open(bsp_path, "rb") as fh:
         fh.seek(lump_ofs)
-        dmodel0 = fh.read(DMODEL_BOUNDS_SIZE)
-    if len(dmodel0) < DMODEL_BOUNDS_SIZE:
+        dmodel0 = fh.read(DMODEL_T_SIZE)
+    if len(dmodel0) < DMODEL_T_SIZE:
         fail("BSP '%s': не удалось прочитать dmodel[0]" % bsp_path)
 
-    mins = struct.unpack("<3f", dmodel0[0:12])
-    maxs = struct.unpack("<3f", dmodel0[12:24])
+    mins = struct.unpack_from("<3f", dmodel0, 0)
+    maxs = struct.unpack_from("<3f", dmodel0, 12)
+    # dmodel_t после границ: float origin[3]; int headnode[4]; int visleafs,
+    # firstface, numfaces (смещения 24/36/52; итого 64 байта)
+    _origin = struct.unpack_from("<3f", dmodel0, 24)
+    _headnode = struct.unpack_from("<4i", dmodel0, 36)
+    visleafs, firstface, numfaces = struct.unpack_from("<3i", dmodel0, 52)
+
+    # Структурная валидация dmodel[0] (урок warfare.bsp: неверный индекс
+    # lump'а давал ПРАВДОПОДОБНЫЙ нулевой вывод вместо ошибки). Мировая
+    # модель обязана иметь геометрию: numfaces > 0, firstface == 0 (мировая
+    # модель всегда первая по списку face), visleafs >= 0.
+    if numfaces <= 0 or firstface != 0 or visleafs < 0:
+        fail(
+            "BSP '%s': dmodel[0] не похож на мировую модель (numfaces=%d, "
+            "firstface=%d, visleafs=%d, nummodels=%d) — вероятно, неверная "
+            "версия формата или повреждён каталог. %s"
+            % (bsp_path, numfaces, firstface, visleafs, nummodels,
+               MANUAL_JSON_HINT)
+        )
+
+    # Вырожденные границы — тоже ошибка, а не «нули на доверие»
+    if maxs[0] <= mins[0] or maxs[1] <= mins[1]:
+        fail(
+            "BSP '%s': вырожденные границы dmodel[0]: X[%g..%g] Y[%g..%g] "
+            "— карта повреждена или dmodel[0] не мировая модель. %s"
+            % (bsp_path, mins[0], maxs[0], mins[1], maxs[1], MANUAL_JSON_HINT)
+        )
 
     def as_int(value: float) -> int:
         # мировые границы в BSP29 целые; устраняем погрешность float32
