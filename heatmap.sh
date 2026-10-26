@@ -499,7 +499,7 @@ map_backdrop_dims() {
     if (( _bmaxx <= _bminx || _bmaxy <= _bminy )); then
         die 3 "границы BSP некорректны: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy] — проверьте карту и MAPINFO_SCALING (FR-13)"
     fi
-    log INFO "границы карты из BSP: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy]"
+    log INFO "границы карты из вершин BSP (bbox VERTEXES): X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy]"
     # Границы наружу (глобальные) — для кросс-проверки с Bounds bsp2bmp (v1.0.3)
     _G_BXMIN="$_bminx"; _G_BYMIN="$_bminy"; _G_BXMAX="$_bmaxx"; _G_BYMAX="$_bmaxy"
     _RW=$(( ( _bmaxx - _bminx ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
@@ -548,16 +548,28 @@ if [[ ! -f "$BMP_PATH" ]]; then
         log INFO "подложка инвертирована (mogrify -negate, BLANK_MAP_NEGATE=true)"
     fi
     map_backdrop_dims
-    # Кросс-проверка границ (v1.0.3, FR-13): dmodel[0] из каталога lump'ов
-    # против вершин, по которым bsp2bmp рендерил подложку. Урок warfare.bsp:
-    # неверный индекс MODELS в каталоге давал правдоподобные нули молча,
-    # а расхождение здесь означало бы сдвиг/масштаб маркеров на рендере.
+    # Кросс-проверка границ (v1.0.3, уточнена в v1.0.5): bbox вершин BSP
+    # (make_mapinfo, VERTEXES-ламп) против Bounds из вывода bsp2bmp — это
+    # ОДИН И ТОТ ЖЕ набор вершин (bsp2bmp рендерит по всем рёбрам всех
+    # моделей), поэтому совпадение ОБЯЗАТЕЛЬНО, а расхождение означает сбой
+    # захвата вывода или инверсии Y (в Bounds bsp2bmp ось Y — изображения:
+    # мировые Y = (-y_max, -y_min)). Допуск ±1 — на округление %.0f.
+    # История: в v1.0.3 сравнивались dmodel[0] и вершины bsp2bmp; на
+    # warfare.bsp (прод, 2026-10-27) они закономерно не сошлись — dmodel[0]
+    # (браши world-модели, сетка «кратно 32 ± 1»: X[-511..959] Y[-863..671])
+    # не обязан совпадать с bbox ВСЕХ вершин X[-480..928] Y[-832..752]
+    # (суб-модели могут выходить за браши world-модели). Источник границ
+    # переведён на вершины; dmodel[0] — структурная проверка + WARN внутри
+    # make_mapinfo.py.
     if [[ -n "${_bsp_bounds:-}" ]]; then
         read -r _bb_xmin _bb_xmax _bb_ymin _bb_ymax <<< "$_bsp_bounds"
-        if (( _bb_xmin != _G_BXMIN || _bb_xmax != _G_BXMAX || _bb_ymin != _G_BYMIN || _bb_ymax != _G_BYMAX )); then
-            die 3 "кросс-проверка границ не сошлась: dmodel[0] X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] против вершин bsp2bmp X[$_bb_xmin..$_bb_xmax] Y[$_bb_ymin..$_bb_ymax] — привязка координат была бы неверной (FR-13)"
+        if (( _bb_xmin < _G_BXMIN - 1 || _bb_xmin > _G_BXMIN + 1 ||
+              _bb_xmax < _G_BXMAX - 1 || _bb_xmax > _G_BXMAX + 1 ||
+              _bb_ymin < _G_BYMIN - 1 || _bb_ymin > _G_BYMIN + 1 ||
+              _bb_ymax < _G_BYMAX - 1 || _bb_ymax > _G_BYMAX + 1 )); then
+            die 3 "кросс-проверка границ не сошлась: вершины BSP X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] против рендера bsp2bmp X[$_bb_xmin..$_bb_xmax] Y[$_bb_ymin..$_bb_ymax] — сбой захвата вывода или инверсии Y, привязка координат была бы неверной (FR-13)"
         fi
-        log INFO "кросс-проверка границ: dmodel[0] == вершины bsp2bmp, X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] — OK (FR-13)"
+        log INFO "кросс-проверка границ: вершины BSP == рендер bsp2bmp, X[$_G_BXMIN..$_G_BXMAX] Y[$_G_BYMIN..$_G_BYMAX] — OK (FR-13)"
     else
         log WARN "Bounds не найдены в выводе bsp2bmp — кросс-проверка границ пропущена (FR-13)"
     fi

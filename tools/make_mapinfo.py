@@ -8,6 +8,16 @@ make_mapinfo.py — генератор mapinfo (blank_map/<map>.json) для hea
     bspName, minX, minY, maxX, maxY, width, height,
     imageWidth, imageHeight, padding, scaling
 
+ИСТОЧНИК ГРАНИЦ (v1.0.5): bbox по ВСЕМ вершинам VERTEXES-ламп (индекс 3).
+Это тот же набор вершин, по которому bsp2bmp рендерит подложку (все рёбра
+всех моделей), поэтому привязка маркеров обязана идти по нему. dmodel[0]
+(браши world-модели) для этого НЕ годится: на warfare.bsp его bbox
+X[-511..959] Y[-863..671] (сетка «кратно 32 ± 1») закономерно отличается от
+вершинного X[-480..928] Y[-832..752] — суб-модели/браши не совпадают по
+охвату. dmodel[0] используется как структурная проверка BSP29 (урок
+дефекта «0 0 0 0», см. историю в комментарии каталога ниже); при отличии
+его bbox от вершинного печатается WARN (не ошибка).
+
 Использование:
     make_mapinfo.py <map>.bmp <map>.bsp [--padding N] [--scaling N]
                     [--output <path.json>] [--force]
@@ -43,9 +53,11 @@ BSP_LUMP_ENTRY_SIZE = 8      # int32 fileofs, int32 filelen
 # подложка 21x21); «фикс» v1.0.2 ставил 13 (= SURFEDGES → те же нули,
 # валидация ofs/len при этом проходила). Канонический индекс MODELS — 14.
 BSP_LUMP_MODELS = 14
+BSP_LUMP_VERTEXES = 3        # индекс VERTEXES в каталоге BSP29 (см. выше)
 BSP_LUMP_COUNT = 15
 
 DMODEL_T_SIZE = 64           # sizeof(dmodel_t) BSP29 (см. bspfile.h)
+VERTEX_SIZE = 12             # float32 x, y, z — одна вершина VERTEXES
 DMODEL_BOUNDS_SIZE = 24      # float32 mins[3] + float32 maxs[3]
 
 BSP2_MAGICS = (b"2PSB", b"BSP2")
@@ -67,8 +79,8 @@ def fail(msg: str) -> "None":
     sys.exit(1)
 
 
-def parse_bsp29_bounds(bsp_path: str):
-    """Возвращает (minX, minY, maxX, maxY) из dmodel[0] BSP29."""
+def _read_bsp29_lumps(bsp_path: str):
+    """Заголовок BSP29 → (size, [(ofs, len) × 15]) с проверками формата."""
     try:
         size = os.path.getsize(bsp_path)
         with open(bsp_path, "rb") as fh:
@@ -94,9 +106,24 @@ def parse_bsp29_bounds(bsp_path: str):
             % (bsp_path, version, MANUAL_JSON_HINT)
         )
 
-    lump_ofs, lump_len = struct.unpack_from(
-        "<ii", head, BSP_HEADER_SIZE + BSP_LUMP_MODELS * BSP_LUMP_ENTRY_SIZE
-    )
+    lumps = []
+    for i in range(BSP_LUMP_COUNT):
+        lumps.append(
+            struct.unpack_from(
+                "<2i", head, BSP_HEADER_SIZE + i * BSP_LUMP_ENTRY_SIZE
+            )
+        )
+    return size, lumps
+
+
+def _dmodel0_check(bsp_path: str, size: int, lumps):
+    """Читает dmodel[0] и проводит структурную валидацию BSP29.
+
+    Возвращает (mins[3], maxs[3]) float. Сам bbox dmodel[0] границами
+    карты НЕ считается (см. docstring модуля) — только проверка структуры:
+    неверный индекс lump'а или повреждение должны давать громкую ошибку,
+    а не правдоподобные нули (урок warfare.bsp 2026-10-26/27)."""
+    lump_ofs, lump_len = lumps[BSP_LUMP_MODELS]
     if lump_ofs <= 0 or lump_len < DMODEL_T_SIZE or lump_ofs + lump_len > size:
         fail(
             "BSP '%s': некорректный lump MODELS (ofs=%d, len=%d) — файл не "
@@ -111,9 +138,12 @@ def parse_bsp29_bounds(bsp_path: str):
         )
     nummodels = lump_len // DMODEL_T_SIZE
 
-    with open(bsp_path, "rb") as fh:
-        fh.seek(lump_ofs)
-        dmodel0 = fh.read(DMODEL_T_SIZE)
+    try:
+        with open(bsp_path, "rb") as fh:
+            fh.seek(lump_ofs)
+            dmodel0 = fh.read(DMODEL_T_SIZE)
+    except OSError as exc:
+        fail("не удалось прочитать dmodel[0] из '%s': %s" % (bsp_path, exc))
     if len(dmodel0) < DMODEL_T_SIZE:
         fail("BSP '%s': не удалось прочитать dmodel[0]" % bsp_path)
 
@@ -146,12 +176,81 @@ def parse_bsp29_bounds(bsp_path: str):
             % (bsp_path, mins[0], maxs[0], mins[1], maxs[1], MANUAL_JSON_HINT)
         )
 
-    def as_int(value: float) -> int:
-        # мировые границы в BSP29 целые; устраняем погрешность float32
-        r = round(value)
-        return int(r) if abs(value - r) < 0.01 else value
+    return mins, maxs
 
-    return as_int(mins[0]), as_int(mins[1]), as_int(maxs[0]), as_int(maxs[1])
+
+def _vertexes_bbox(bsp_path: str, size: int, lumps):
+    """BBox по ВСЕМ вершинам VERTEXES-ламп (мировые координаты, float)."""
+    ofs, ln = lumps[BSP_LUMP_VERTEXES]
+    if ofs <= 0 or ln < VERTEX_SIZE or ofs + ln > size or ln % VERTEX_SIZE != 0:
+        fail(
+            "BSP '%s': некорректный lump VERTEXES (ofs=%d, len=%d) — файл не "
+            "похож на BSP29 или повреждён. %s"
+            % (bsp_path, ofs, ln, MANUAL_JSON_HINT)
+        )
+    try:
+        with open(bsp_path, "rb") as fh:
+            fh.seek(ofs)
+            data = fh.read(ln)
+    except OSError as exc:
+        fail("не удалось прочитать VERTEXES из '%s': %s" % (bsp_path, exc))
+
+    min_x = min_y = math.inf
+    max_x = max_y = -math.inf
+    for x, y, _z in struct.iter_unpack("<3f", data):
+        if x < min_x:
+            min_x = x
+        if x > max_x:
+            max_x = x
+        if y < min_y:
+            min_y = y
+        if y > max_y:
+            max_y = y
+
+    if max_x <= min_x or max_y <= min_y:
+        fail(
+            "BSP '%s': вырожденный bbox вершин: X[%g..%g] Y[%g..%g] "
+            "— карта повреждена. %s"
+            % (bsp_path, min_x, max_x, min_y, max_y, MANUAL_JSON_HINT)
+        )
+    return min_x, min_y, max_x, max_y
+
+
+def parse_bsp29_bounds(bsp_path: str):
+    """Мировые границы карты: bbox по всем вершинам VERTEXES (int).
+
+    Возвращает (minX, minY, maxX, maxY) ЦЕЛЫМИ: floor(min)/ceil(max) —
+    границы только расширяются, маркеры на реальных картах с дробными
+    вершинами (пересечения плоскостей) не подрезаются. Целость нужна и
+    bash-стороне (regex 'minX minY maxX maxY', арифметика W/H).
+    """
+    size, lumps = _read_bsp29_lumps(bsp_path)
+    dmins, dmaxs = _dmodel0_check(bsp_path, size, lumps)
+    vmin_x, vmin_y, vmax_x, vmax_y = _vertexes_bbox(bsp_path, size, lumps)
+
+    # Расхождение bbox dmodel[0] и всех вершин — НЕ ошибка: у warfare.bsp
+    # dmodel[0] X[-511..959] Y[-863..671] (браши world-модели на сетке
+    # «кратно 32 ± 1») против вершин X[-480..928] Y[-832..752] (прод,
+    # 2026-10-27). Но WARN обязателен: раньше именно это расхождение
+    # ловило неверный индекс lump'а.
+    _tol = 1.0
+    if (abs(dmins[0] - vmin_x) > _tol or abs(dmaxs[0] - vmax_x) > _tol
+            or abs(dmins[1] - vmin_y) > _tol or abs(dmaxs[1] - vmax_y) > _tol):
+        warn(
+            "bbox dmodel[0] X[%g..%g] Y[%g..%g] отличается от bbox всех "
+            "вершин X[%g..%g] Y[%g..%g] — использую вершины (подложка "
+            "рендерится по всем рёбрам; обычно это суб-модели/браши "
+            "world-модели с разным охватом)"
+            % (dmins[0], dmaxs[0], dmins[1], dmaxs[1],
+               vmin_x, vmax_x, vmin_y, vmax_y)
+        )
+
+    return (
+        int(math.floor(vmin_x)),
+        int(math.floor(vmin_y)),
+        int(math.ceil(vmax_x)),
+        int(math.ceil(vmax_y)),
+    )
 
 
 def read_bmp_size(bmp_path: str):
