@@ -485,6 +485,7 @@ MAKE_MAPINFO="${TOOLS_DIR}/make_mapinfo.py"
 # основном контексте (не внутри $( ) — die внутри под-оболочки не завершит
 # скрипт, ошибка будет молча проглочена; грабля уже ловилась на demoinfo).
 map_backdrop_dims() {
+    (( ${_G_DIMS_DONE:-0} == 1 )) && return 0
     local _bounds _bminx _bminy _bmaxx _bmaxy
     _bounds="$(python3 "$MAKE_MAPINFO" --bounds "$BSP_PATH")" || {
         die 3 "make_mapinfo --bounds не удался: BSP не BSP29? инструкции по ручному созданию json — в сообщении выше и в README (FR-13)"
@@ -507,9 +508,75 @@ map_backdrop_dims() {
     if (( _RW < 1 || _RH < 1 )); then
         die 3 "вычислен некорректный размер подложки ${_RW}x${_RH} (проверьте MAPINFO_SCALING/границы BSP)"
     fi
+    _G_DIMS_DONE=1
 }
 
-if [[ ! -f "$BMP_PATH" ]]; then
+# ----------------------------------------------------------------------------
+# Посадка контента подложки на канву расчётного размера (v1.0.7, 8.7.3).
+# История дефекта: bsp2bmp пишет буфер ФИКСИРОВАННОГО размера 1903x1903
+# (проверено на warfare/travelert6/utressor), контент размером
+# floor(dX/sc)+3 x floor(dY/sc)+3 размещается внутри буфера от мирового
+# нуля (центр буфера = (0,0) карты, офсеты ~+830+742 у warfare). Редакции
+# до v1.0.6 ужимали ВЕСЬ буфер до расчётного размера (mogrify -resize
+# 373x417!) — карта сжималась в ~5 раз и повисала в центре канвы, точки
+# уезжали с карты (прод warfare 2026-10-27, прогон №5). Рецепт восстановлен
+# по эталонным подложкам заготовки автора (travelert6.bmp 549x461 =
+# контент 531x443+9+9; utressor.bmp 332x257 = 314x239+9+9): вырезаем bbox
+# контента (convert -trim, «%@») и сажаем его в центр канвы расчётного
+# размера (-gravity center -extent). Проверено: fit на фикстуре travelert6
+# даёт ровно геометрию эталона (531x443+9+9 на 549x461).
+# Фон канвы — цвет угла (0,0) исходного буфера (после -negate это белый).
+# Вызывать ПОСЛЕ map_backdrop_dims (нужны _RW/_RH и _G_B*) и в основном
+# контексте (die внутри $( ) не завершит скрипт — грабля уже ловилась).
+# ----------------------------------------------------------------------------
+map_backdrop_fit() {
+    local _bbox _cw _ch _ox _oy _bg _ex _ey
+    _bbox="$(convert "$BMP_PATH" -format "%@" info: 2>/dev/null)" || {
+        die 3 "не удалось измерить bbox контента подложки (convert -trim) — 8.7.3"
+    }
+    if [[ ! "$_bbox" =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+        die 3 "неожиданный ответ trim '${_bbox}' — 8.7.3"
+    fi
+    _cw=${BASH_REMATCH[1]}; _ch=${BASH_REMATCH[2]}
+    _ox=${BASH_REMATCH[3]}; _oy=${BASH_REMATCH[4]}
+    # физические границы контента: не меньше bbox вершин (округление растра)
+    # и не больше канвы; выход за них — аномалия рендера
+    _ex=$(( ( _G_BXMAX - _G_BXMIN ) / MAPINFO_SCALING ))
+    _ey=$(( ( _G_BYMAX - _G_BYMIN ) / MAPINFO_SCALING ))
+    if (( _cw < _ex - 2 || _ch < _ey - 2 || _cw > _RW || _ch > _RH )); then
+        die 3 "bbox контента подложки ${_cw}x${_ch} вне ожиданий (вершины ~${_ex}x${_ey}, канва ${_RW}x${_RH}) — 8.7.3"
+    fi
+    _bg="$(convert "$BMP_PATH" -format "%[pixel:p{0,0}]" info: 2>/dev/null)" || _bg=""
+    if [[ -z "$_bg" ]]; then
+        if [[ "$BLANK_MAP_NEGATE" == "true" ]]; then _bg="white"; else _bg="black"; fi
+    fi
+    convert "$BMP_PATH" -crop "${_cw}x${_ch}+${_ox}+${_oy}" +repage \
+            -background "$_bg" -gravity center -extent "${_RW}x${_RH}" "$BMP_PATH" || {
+        die 3 "посадка контента подложки на канву ${_RW}x${_RH} не удалась — 8.7.3"
+    }
+    log INFO "подложка: контент ${_cw}x${_ch} вырезан из буфера bsp2bmp и посажен на канву ${_RW}x${_RH} (фон ${_bg}) — 8.7.3"
+}
+
+# ----------------------------------------------------------------------------
+# Контент-проверка существующей подложки (v1.0.7): bbox контента должен
+# соответствовать ожидаемому floor(dX/sc)+3 x floor(dY/sc)+3 (допуск ±6 на
+# растеризацию линий/дробные вершины; подтверждено на travelert6 531x443,
+# utressor 314..315x239, warfare 355x399). Ловит «ужатые» подложки v1.0.6
+# (буфер 1903x1903, ужатый до 373x417: карта ~69x87 px в центре канвы при
+# ожидаемых 355x399) и любые чужие/повреждённые подложки. 1 = не соответствует.
+# ----------------------------------------------------------------------------
+map_backdrop_content_ok() {
+    local _bbox _cw _ch
+    _G_EW=$(( ( _G_BXMAX - _G_BXMIN ) / MAPINFO_SCALING + 3 ))
+    _G_EH=$(( ( _G_BYMAX - _G_BYMIN ) / MAPINFO_SCALING + 3 ))
+    _bbox="$(convert "$BMP_PATH" -format "%@" info: 2>/dev/null)" || return 1
+    [[ "$_bbox" =~ ^([0-9]+)x([0-9]+)\+ ]] || return 1
+    _cw=${BASH_REMATCH[1]}; _ch=${BASH_REMATCH[2]}
+    _G_CBB="$_bbox"
+    (( _cw >= _G_EW - 6 && _cw <= _G_EW + 6 && _ch >= _G_EH - 6 && _ch <= _G_EH + 6 ))
+}
+
+generate_backdrop() {
     if [[ ! -f "$BSP_PATH" ]]; then
         die 3 "нет ни подложки ${BMP_PATH}, ни исходника карты ${BSP_PATH} (FR-12)"
     fi
@@ -547,7 +614,6 @@ if [[ ! -f "$BMP_PATH" ]]; then
         mogrify -negate "$BMP_PATH" || die 3 "mogrify -negate не удался (FR-12/FR-37)"
         log INFO "подложка инвертирована (mogrify -negate, BLANK_MAP_NEGATE=true)"
     fi
-    map_backdrop_dims
     # Кросс-проверка границ (v1.0.3, уточнена в v1.0.5): bbox вершин BSP
     # (make_mapinfo, VERTEXES-ламп) против Bounds из вывода bsp2bmp — это
     # ОДИН И ТОТ ЖЕ набор вершин (bsp2bmp рендерит по всем рёбрам всех
@@ -573,32 +639,49 @@ if [[ ! -f "$BMP_PATH" ]]; then
     else
         log WARN "Bounds не найдены в выводе bsp2bmp — кросс-проверка границ пропущена (FR-13)"
     fi
-    mogrify -resize "${_RW}x${_RH}!" "$BMP_PATH" || die 3 "mogrify -resize ${_RW}x${_RH}! не удался (8.7.3)"
-    log INFO "подложка приведена к расчётному размеру ${_RW}x${_RH}"
-fi
+    map_backdrop_fit
+    _G_BMP_FRESH=1
+}
 
-# Ремонт заголовка и для УЖЕ СУЩЕСТВОВАВШИХ подложек (в т.ч. перенесённых
-# из заготовки с тем же дефектом bfSize): делает чтение IM6 на рендере
-# чистым (без rc≠0 «по факту создания файла»). Идемпотентен.
-_fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
-[[ -n "$_fixr" ]] && log INFO "заголовок существующей подложки исправлен (${_fixr}) — 8.7.2"
+# ----------------------------------------------------------------------------
+# Выбор: сгенерировать подложку или проверить существующую (v1.0.7).
+# Легаси-режим «готовые bmp+json без .bsp» сохранён: без BSP не делаем ни
+# проверок границ, ни перегенерации — только идемпотентный ремонт заголовка.
+# Иначе границы считаются ВСЕГДА (один python-парс), а существующая подложка
+# проверяется по размеру И по контенту: RAW-буфер или «ужатая» подложка
+# прошлых редакций перегенерируются автоматически (раньше здесь был
+# -resize всего буфера — источник дефекта «карта в 5 раз меньше канвы»).
+# ----------------------------------------------------------------------------
+_G_DIMS_DONE=0
+_G_BMP_FRESH=0
+if [[ -f "$BMP_PATH" && ! -f "$BSP_PATH" ]]; then
+    _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
+    [[ -n "$_fixr" ]] && log INFO "заголовок существующей подложки исправлен (${_fixr}) — 8.7.2"
+else
+    map_backdrop_dims
+    if [[ ! -f "$BMP_PATH" ]]; then
+        generate_backdrop
+    else
+        _dims="$(identify -format '%w %h' "$BMP_PATH" 2>/dev/null)" || _dims=""
+        _dims="${_dims// /x}"
+        if [[ "$_dims" != "${_RW}x${_RH}" ]]; then
+            log WARN "размер существующей подложки ${_dims:-неизвестен} не совпадает с расчётным ${_RW}x${_RH} — перегенерирую из ${BSP_PATH} (8.7.3, v1.0.7)"
+            generate_backdrop
+        elif ! map_backdrop_content_ok; then
+            log WARN "контент существующей подложки (${_G_CBB:-неизвестен}) не соответствует ожидаемому ~${_G_EW}x${_G_EH} — перегенерирую из ${BSP_PATH} (v1.0.7: ремонт «ужатых» подложек v1.0.6)"
+            generate_backdrop
+        else
+            _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
+            [[ -n "$_fixr" ]] && log INFO "заголовок существующей подложки исправлен (${_fixr}) — 8.7.2"
+        fi
+    fi
+fi
 
 if [[ ! -f "$JSON_PATH" ]]; then
     if [[ ! -f "$BSP_PATH" ]]; then
         die 3 "нет mapinfo ${JSON_PATH} и исходника карты ${BSP_PATH} — json не сгенерировать (FR-13)"
     fi
     log INFO "генерация mapinfo: ${JSON_PATH}"
-    # Размер существующей подложки должен соответствовать формуле 8.7.3.
-    # Найдено на warfare (2026-10-26): неоконченный прогон сервера оставил
-    # в blank_map RAW-вывод bsp2bmp 1903x1903 — без этого выравнивания json
-    # зафиксировал бы неверные imageWidth/imageHeight и рендер уехал бы.
-    map_backdrop_dims
-    _dims="$(identify -format '%w %h' "$BMP_PATH" 2>/dev/null)" || _dims=""
-    if [[ "$_dims" != "${_RW} ${_RH}" ]]; then
-        log INFO "размер подложки ${_dims:-неизвестен} не совпадает с расчётным ${_RW}x${_RH} — привожу (8.7.3)"
-        mogrify -resize "${_RW}x${_RH}!" "$BMP_PATH" || die 3 "mogrify -resize ${_RW}x${_RH}! не удался (8.7.3)"
-        log INFO "подложка приведена к расчётному размеру ${_RW}x${_RH}"
-    fi
     python3 "$MAKE_MAPINFO" "$BMP_PATH" "$BSP_PATH" \
         --padding "$MAPINFO_PADDING" --scaling "$MAPINFO_SCALING" \
         --output "$JSON_PATH" || {
