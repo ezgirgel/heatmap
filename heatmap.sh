@@ -702,13 +702,28 @@ if (( BMP_QUIRK == 1 )); then
     log INFO "bmp имеет некорректное поле размера в заголовке (известная особенность исходных подложек); IM6 при этом возвращает ненулевой код — принимаю кадры по факту создания файла"
 fi
 
-# параметры рендера из mapinfo (8.1.7 — соответствие референсу test.sh)
+# параметры рендера из mapinfo (8.1.7). Ось Y — ПРЯМАЯ (v1.0.8):
+# MIN_Y = minY/scaling, MAX_Y = maxY/scaling — как и для X.
+# ЭРРАТА РЕФЕРЕНСА (v1.0.1..v1.0.7): test.sh автора задавал
+# MIN_Y = -maxY/scaling, MAX_Y = -minY/scaling («зеркало») — по-видимому,
+# компенсируя то, что Bounds Y в отчёте bsp2bmp даёт координаты ИЗОБРАЖЕНИЯ
+# (ось вниз, зеркальны координатам файла BSP). Но данные демки и json
+# (make_mapinfo читает VERTEXES как есть) живут в координатах ФАЙЛА,
+# компенсировать нечего: зеркало сдвигало ВСЕ точки на 2*padding (~21 px)
+# вниз относительно подложки, а точки за южным краем диапазона молча
+# обрезались gnuplot'ом. На проде это выглядело как «точки съехали по одной
+# оси» (warfare, 2026-10-27): маркеры висели ниже южной линии карты
+# (строки 408..415 при крае 407) и НИКОГДА не поднимались выше строки ~30
+# (жёсткое ограничение зеркальных формул) — проверено по 20 кадрам GIF
+# прогона №4 и скриншоту прогона №6. Проверка геометрии на фикстуре
+# (веер-тест: маркер в вершине (0,0), T-22): прямые формулы сажают маркер
+# в пиксель вершины с точностью ~1 px, зеркальные — мимо на ~20 px.
 PADDING="$(jq -er '.padding | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля padding"
 SCALING="$(jq -er '.scaling | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля scaling"
 MIN_X="$(jq -r '.minX/.scaling' "$JSON_PATH")"
 MAX_X="$(jq -r '.maxX/.scaling' "$JSON_PATH")"
-MAX_Y="$(jq -r '.minY/.scaling*-1' "$JSON_PATH")"
-MIN_Y="$(jq -r '.maxY/.scaling*-1' "$JSON_PATH")"
+MIN_Y="$(jq -r '.minY/.scaling' "$JSON_PATH")"
+MAX_Y="$(jq -r '.maxY/.scaling' "$JSON_PATH")"
 if ! is_num "$PADDING"; then die 3 "mapinfo: padding='${PADDING}' не число"; fi
 if ! is_num "$SCALING"; then die 3 "mapinfo: scaling='${SCALING}' не число"; fi
 if ! awk -v s="$SCALING" 'BEGIN{exit !(s>0)}'; then die 3 "mapinfo: scaling должен быть > 0"; fi
