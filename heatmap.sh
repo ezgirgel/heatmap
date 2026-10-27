@@ -4,9 +4,7 @@
 #
 # Точка входа пост-обработки партии: вызывается mvdsv после матча без
 # аргументов (вся информация о партии — в demoinfo-файле). По каждому игроку
-# строит анимированный GIF перемещений на фоне подложки карты; одновременно
-# может строить статическую карту времени жизни <ник>_life.png (v1.0.10,
-# ключ STATIC_MODE: off|longest|full).
+# строит анимированный GIF перемещений на фоне подложки карты.
 #
 # Вызов:  heatmap.sh [путь-к-demoinfo]
 #         $1 (опционально) перекрывает DEMOINFO_FILE из конфига.
@@ -64,7 +62,7 @@ fi
 source "$CONFIG"
 
 # ----------------------------------------------------------------------------
-# Раскладка инструментов (v1.0.4): бинарники поставки лежат в tools/. Для
+# Раскладка инструментов: бинарники поставки лежат в tools/. Для
 # совместимости со старыми установками (файлы в корне рядом со скриптом)
 # путь выбирается по факту наличия файла: tools/ приоритетен, корень — фолбэк.
 # Явно заданные в конфиге/окружении MVDPARSER_BIN/BSP2BMP_BIN приоритетнее.
@@ -98,33 +96,23 @@ _hm_tool_path() {
 : "${BSP2BMP_ARGS:=-s4 -z0 -p0 -e -c+Z}"
 : "${LOCK_FILE:=${TMP_BASE}/heatmap.lock}"
 
-: "${GIF_MODE:=interleave}"
-: "${CHUNK_SECONDS:=30}"
+# кадры GIF — interleave (8.2): кадр f содержит каждый NUM-й замер партии
 : "${MAX_FRAMES:=20}"
-: "${MAX_FRAMES_CAP:=120}"
 : "${MIN_DATA_LINES:=10}"
 : "${GIF_DELAY_CS:=5}"
 : "${GIF_LOOP:=0}"
 : "${GIF_OPTIMIZE_FUZZ:=10}"
-# v1.0.10: статические карты времени жизни (строятся одновременно с GIF):
-#   off     — не строить (поведение до v1.0.10);
-#   longest — самое долгое время жизни игрока: от рождения (первая точка
-#             после появления) до смерти (первый маркер смерти серии);
-#   full    — всё присутствие игрока в партии (первая точка — последняя).
-: "${STATIC_MODE:=longest}"
 
 : "${PALETTE_MIN_COLOR:=blue}"
 : "${PALETTE_MAX_COLOR:=red}"
 : "${PALETTE_CUSTOM:=}"
 : "${MARKER_MOVE_TYPE:=5}"
-: "${MARKER_MOVE_SIZE:=5}"
 : "${MARKER_DEATH_TYPE:=2}"
-: "${MARKER_DEATH_SIZE:=2}"
-# v1.0.9: концы формулы высоты для размера маркера:
+# концы формулы высоты для размера маркера:
 #   size = MIN_MARKER_SIZE + t*(MAX_MARKER_SIZE-MIN_MARKER_SIZE),
-#   t = (z-MIN_Z)/(MAX_Z-MIN_Z)  (старые MARKER_*_SIZE по-прежнему игнорируются)
-: "${MIN_MARKER_SIZE:=0.5}"
-: "${MAX_MARKER_SIZE:=3.0}"
+#   t = (z-MIN_Z)/(MAX_Z-MIN_Z)
+: "${MIN_MARKER_SIZE:=0.7}"
+: "${MAX_MARKER_SIZE:=1.5}"
 : "${BLANK_MAP_NEGATE:=false}"
 : "${Z_OUTLIER_MIN_COUNT:=10}"
 : "${MAPINFO_PADDING:=10}"
@@ -135,8 +123,8 @@ _hm_tool_path() {
 : "${LOG_RETENTION_DAYS:=30}"
 : "${LOCK_WAIT_SEC:=1800}"
 : "${KEEP_TMP_ON_FAIL:=true}"
-# v1.0.9: класть ли копию demoinfo.json в каталог результата (провенанс)
-: "${RESULT_COPY_DEMOINFO:=true}"
+# класть ли копию demoinfo.json в каталог результата (провенанс)
+: "${RESULT_COPY_DEMOINFO:=false}"
 : "${NICE_LEVEL:=}"
 
 # ----------------------------------------------------------------------------
@@ -155,7 +143,7 @@ validate_conf() {
     done
     # числовые ключи
     local int_keys=(
-        CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES
+        MAX_FRAMES MIN_DATA_LINES
         GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
         Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
         RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
@@ -166,14 +154,6 @@ validate_conf() {
             _die_early 1 "конфиг: ключ ${key}='${!key}' не является целым числом (FR-6)"
         fi
     done
-    # GIF_MODE — перечисление
-    if [[ "$GIF_MODE" != "interleave" && "$GIF_MODE" != "chunks" ]]; then
-        _die_early 1 "конфиг: GIF_MODE='${GIF_MODE}' — допустимо interleave|chunks (FR-6)"
-    fi
-    # STATIC_MODE — перечисление (v1.0.10)
-    if [[ "$STATIC_MODE" != "off" && "$STATIC_MODE" != "longest" && "$STATIC_MODE" != "full" ]]; then
-        _die_early 1 "конфиг: STATIC_MODE='${STATIC_MODE}' — допустимо off|longest|full (FR-6)"
-    fi
     # логические ключи
     local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO)
     for key in "${bool_keys[@]}"; do
@@ -189,15 +169,7 @@ validate_conf() {
             _die_early 1 "конфиг: ключ ${key}='${!key}' — целое 1..15 (pointtype gnuplot, FR-6)"
         fi
     done
-    for key in MARKER_MOVE_SIZE MARKER_DEATH_SIZE; do
-        if ! is_num "${!key}" ; then
-            _die_early 1 "конфиг: ключ ${key}='${!key}' — число > 0 (pointsize, FR-6)"
-        fi
-        if awk -v v="${!key}" 'BEGIN{exit !(v > 0)}'; then :; else
-            _die_early 1 "конфиг: ключ ${key}='${!key}' — должен быть > 0 (FR-6)"
-        fi
-    done
-    # v1.0.9: концы формулы высоты — числа > 0, MIN <= MAX (7.3, FR-6)
+    # концы формулы высоты — числа > 0, MIN <= MAX (7.3, FR-6)
     for key in MIN_MARKER_SIZE MAX_MARKER_SIZE; do
         if ! is_num "${!key}" || ! awk -v v="${!key}" 'BEGIN{exit !(v > 0)}'; then
             _die_early 1 "конфиг: ключ ${key}='${!key}' — число > 0 (pointsize, FR-6)"
@@ -228,10 +200,10 @@ check_unknown_keys() {
         MVDPARSER_BIN FRAGFILE TEMPLATE_TPL GNUPLOT_SCRIPT
         BSP2BMP_BIN BSP2BMP_ARGS
         RESULT_DIR LOG_DIR TMP_BASE LOCK_FILE TOOLS_DIR
-        GIF_MODE CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES STATIC_MODE
+        MAX_FRAMES MIN_DATA_LINES
         GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
-        MARKER_MOVE_TYPE MARKER_MOVE_SIZE MARKER_DEATH_TYPE MARKER_DEATH_SIZE
+        MARKER_MOVE_TYPE MARKER_DEATH_TYPE
         MIN_MARKER_SIZE MAX_MARKER_SIZE RESULT_COPY_DEMOINFO
         Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
         RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
@@ -265,10 +237,9 @@ mkdir -p "$LOG_DIR" 2>/dev/null || _die_early 1 "не удалось созда�
 LOG_FILE="${LOG_DIR}/heatmap-$(date +%F).log"
 touch "$LOG_FILE" 2>/dev/null || _die_early 1 "не удалось открыть лог: ${LOG_FILE}"
 
-# Подводный камень (найден на прогоне): nice-перезапуск (FR-4) исполняет скрипт
-# повторно, и без защиты здесь выстраивалась цепочка tee->tee — каждая строка
-# попадала в файл лога дважды. Флаг-хранец делает инициализацию одноразовой:
-# повторный проход наследует уже установленный редирект (одна цепочка tee).
+# nice-перезапуск (FR-4) исполняет скрипт повторно; флаг-хранец делает
+# инициализацию одноразовой (иначе выстраивается цепочка tee->tee и каждая
+# строка лога дублируется). Повторный проход наследует установленный редирект.
 if [[ "${_HM_LOG_TEE:-0}" != "1" ]]; then
     exec &> >(tee -a "$LOG_FILE")
     export _HM_LOG_TEE=1
@@ -349,10 +320,10 @@ gp_str() {
 }
 
 # ----------------------------------------------------------------------------
-# Trap выхода: уборка run-каталога (FR-30). v1.0.9 «умная уборка»: при сбое
-# KEEP_TMP_ON_FAIL=true сохраняет run-каталог ТОЛЬКО если в нём есть файлы
-# (есть что разбирать); пустой каталог (сбой до парсинга/рендера) удаляется
-# всегда — пустые frames/XY_data/stage не копятся в tmp.
+# Trap выхода: уборка run-каталога (FR-30). При сбое KEEP_TMP_ON_FAIL=true
+# сохраняет run-каталог только если в нём есть файлы (есть что разбирать);
+# пустой каталог (сбой до парсинга/рендера) удаляется всегда — пустые
+# frames/XY_data/stage в tmp не копятся.
 # ----------------------------------------------------------------------------
 RUN_DIR=""
 hm_on_exit() {
@@ -468,15 +439,11 @@ done
 log INFO "имя каталога результата: ${RNAME}"
 
 # ----------------------------------------------------------------------------
-# Ремонт заголовка BMP (8.7.2). Найдено на реальном прогоне warfare.bsp
-# (2026-10-26): у вывода bsp2bmp поле bfSize в заголовке считается по
-# НЕпаддированной строке и biSizeImage=0. ImageMagick 6 (bmp.c
-# ReadBMPImage) на такое отвечает LengthAndFilesizeDoNotMatch: identify/
-# mogrify дают rc≠0 (mogrify -resize — без результата), композит — rc=0,
-# но с мусором в логе. Переписываем bfSize на фактический размер файла и
-# biSizeImage на фактический объём данных: изображение не меняется ни на
-# бит, но файл читается IM6 строго. Идемпотентно: корректный файл (напр.
-# utressor) не переписывается.
+# Ремонт заголовка BMP (8.7.2): у вывода bsp2bmp bfSize считается по
+# непаддированной строке и biSizeImage=0 — ImageMagick 6 отвечает
+# LengthAndFilesizeDoNotMatch (identify/mogrify дают rc≠0). Переписываем
+# bfSize на фактический размер файла и biSizeImage на фактический объём
+# данных: изображение не меняется, файл читается IM6 строго. Идемпотентно.
 # ----------------------------------------------------------------------------
 fix_bmp_header() {
     local f="$1"
@@ -516,16 +483,15 @@ MAKE_MAPINFO="${TOOLS_DIR}/make_mapinfo.py"
 # Расчётный размер подложки из границ BSP (8.7.3): W = floor(width/scaling)
 # + 2*padding + 1. Устанавливает глобальные _RW/_RH. Вызывать ТОЛЬКО в
 # основном контексте (не внутри $( ) — die внутри под-оболочки не завершит
-# скрипт, ошибка будет молча проглочена; грабля уже ловилась на demoinfo).
+# скрипт, ошибка будет молча проглочена).
 map_backdrop_dims() {
     (( ${_G_DIMS_DONE:-0} == 1 )) && return 0
     local _bounds _bminx _bminy _bmaxx _bmaxy
     _bounds="$(python3 "$MAKE_MAPINFO" --bounds "$BSP_PATH")" || {
         die 3 "make_mapinfo --bounds не удался: BSP не BSP29? инструкции по ручному созданию json — в сообщении выше и в README (FR-13)"
     }
-    # Найдено на warfare.bsp (2026-10-26): мусорный/пустой вывод --bounds
-    # нельзя отдавать в bash-арифметику молча — пустые значения она считает
-    # нулями, и размер подложки превращался в 21x21. Жёсткая проверка формата.
+    # мусорный/пустой вывод --bounds нельзя отдавать в bash-арифметику молча —
+    # пустые значения она считает нулями. Жёсткая проверка формата.
     if [[ ! "$_bounds" =~ ^-?[0-9]+[[:space:]]+-?[0-9]+[[:space:]]+-?[0-9]+[[:space:]]+-?[0-9]+$ ]]; then
         die 3 "make_mapinfo --bounds вернул неожиданный вывод: '${_bounds}' — ожидалось 'minX minY maxX maxY' (FR-13)"
     fi
@@ -534,7 +500,7 @@ map_backdrop_dims() {
         die 3 "границы BSP некорректны: X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy] — проверьте карту и MAPINFO_SCALING (FR-13)"
     fi
     log INFO "границы карты из вершин BSP (bbox VERTEXES): X[$_bminx..$_bmaxx] Y[$_bminy..$_bmaxy]"
-    # Границы наружу (глобальные) — для кросс-проверки с Bounds bsp2bmp (v1.0.3)
+    # Границы наружу (глобальные) — для кросс-проверки с Bounds bsp2bmp
     _G_BXMIN="$_bminx"; _G_BYMIN="$_bminy"; _G_BXMAX="$_bmaxx"; _G_BYMAX="$_bmaxy"
     _RW=$(( ( _bmaxx - _bminx ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
     _RH=$(( ( _bmaxy - _bminy ) / MAPINFO_SCALING + 2 * MAPINFO_PADDING + 1 ))
@@ -545,22 +511,14 @@ map_backdrop_dims() {
 }
 
 # ----------------------------------------------------------------------------
-# Посадка контента подложки на канву расчётного размера (v1.0.7, 8.7.3).
-# История дефекта: bsp2bmp пишет буфер ФИКСИРОВАННОГО размера 1903x1903
-# (проверено на warfare/travelert6/utressor), контент размером
-# floor(dX/sc)+3 x floor(dY/sc)+3 размещается внутри буфера от мирового
-# нуля (центр буфера = (0,0) карты, офсеты ~+830+742 у warfare). Редакции
-# до v1.0.6 ужимали ВЕСЬ буфер до расчётного размера (mogrify -resize
-# 373x417!) — карта сжималась в ~5 раз и повисала в центре канвы, точки
-# уезжали с карты (прод warfare 2026-10-27, прогон №5). Рецепт восстановлен
-# по эталонным подложкам заготовки автора (travelert6.bmp 549x461 =
-# контент 531x443+9+9; utressor.bmp 332x257 = 314x239+9+9): вырезаем bbox
-# контента (convert -trim, «%@») и сажаем его в центр канвы расчётного
-# размера (-gravity center -extent). Проверено: fit на фикстуре travelert6
-# даёт ровно геометрию эталона (531x443+9+9 на 549x461).
-# Фон канвы — цвет угла (0,0) исходного буфера (после -negate это белый).
-# Вызывать ПОСЛЕ map_backdrop_dims (нужны _RW/_RH и _G_B*) и в основном
-# контексте (die внутри $( ) не завершит скрипт — грабля уже ловилась).
+# Посадка контента подложки на канву расчётного размера (8.7.3).
+# bsp2bmp пишет буфер фиксированного размера 1903x1903, внутри которого
+# контент (floor(dX/sc)+3 x floor(dY/sc)+3) размещён от мирового нуля.
+# Поэтому ВЕСЬ буфер ужать нельзя — bbox контента вырезается (convert -trim,
+# «%@») и сажается в центр канвы расчётного размера (-gravity center
+# -extent); фон канвы — цвет угла (0,0) исходного буфера (после -negate
+# это белый). Вызывать ПОСЛЕ map_backdrop_dims (нужны _RW/_RH и _G_B*) и
+# в основном контексте (die внутри $( ) не завершит скрипт).
 # ----------------------------------------------------------------------------
 map_backdrop_fit() {
     local _bbox _cw _ch _ox _oy _bg _ex _ey
@@ -591,12 +549,10 @@ map_backdrop_fit() {
 }
 
 # ----------------------------------------------------------------------------
-# Контент-проверка существующей подложки (v1.0.7): bbox контента должен
+# Контент-проверка существующей подложки: bbox контента должен
 # соответствовать ожидаемому floor(dX/sc)+3 x floor(dY/sc)+3 (допуск ±6 на
-# растеризацию линий/дробные вершины; подтверждено на travelert6 531x443,
-# utressor 314..315x239, warfare 355x399). Ловит «ужатые» подложки v1.0.6
-# (буфер 1903x1903, ужатый до 373x417: карта ~69x87 px в центре канвы при
-# ожидаемых 355x399) и любые чужие/повреждённые подложки. 1 = не соответствует.
+# растеризацию линий/дробные вершины). Ловит чужие/повреждённые/ужатые
+# подложки. 1 = не соответствует.
 # ----------------------------------------------------------------------------
 map_backdrop_content_ok() {
     local _bbox _cw _ch
@@ -616,8 +572,8 @@ generate_backdrop() {
     log INFO "генерация подложки: bsp2bmp -> ${BMP_PATH}"
     mkdir -p "$BLANK_MAP_DIR" || die 3 "не удалось создать ${BLANK_MAP_DIR}"
     # shellcheck disable=SC2086 — BSP2BMP_ARGS намеренно разбивается на слова
-    # Вывод захватывается (v1.0.3): строка Bounds нужна кросс-проверке границ;
-    # сам вывод полностью печатается в лог, как и раньше.
+    # Вывод захватывается: строка Bounds нужна кросс-проверке границ;
+    # сам вывод полностью печатается в лог.
     _bspout="$("$BSP2BMP_BIN" $BSP2BMP_ARGS "$BSP_PATH" "$BMP_PATH" 2>&1)" || {
         printf '%s\n' "${_bspout:-<нет вывода>}" >&2
         die 3 "bsp2bmp завершился с ошибкой (FR-12)"
@@ -639,7 +595,7 @@ generate_backdrop() {
         END { if (x1 != "" && x2 != "" && y1 != "" && y2 != "")
             printf "%.0f %.0f %.0f %.0f\n", x1, x2, -y2, -y1 }
     ')"
-    # Ремонт заголовка ДО любых операций IM (851/857 см. fix_bmp_header):
+    # Ремонт заголовка ДО любых операций IM (см. fix_bmp_header):
     # свежий вывод bsp2bmp IM6 иначе не читает (mogrify -negate/-resize — rc≠0).
     _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
     [[ -n "$_fixr" ]] && log INFO "заголовок BMP исправлен (${_fixr}) — 8.7.2"
@@ -647,19 +603,13 @@ generate_backdrop() {
         mogrify -negate "$BMP_PATH" || die 3 "mogrify -negate не удался (FR-12/FR-37)"
         log INFO "подложка инвертирована (mogrify -negate, BLANK_MAP_NEGATE=true)"
     fi
-    # Кросс-проверка границ (v1.0.3, уточнена в v1.0.5): bbox вершин BSP
-    # (make_mapinfo, VERTEXES-ламп) против Bounds из вывода bsp2bmp — это
-    # ОДИН И ТОТ ЖЕ набор вершин (bsp2bmp рендерит по всем рёбрам всех
-    # моделей), поэтому совпадение ОБЯЗАТЕЛЬНО, а расхождение означает сбой
-    # захвата вывода или инверсии Y (в Bounds bsp2bmp ось Y — изображения:
-    # мировые Y = (-y_max, -y_min)). Допуск ±1 — на округление %.0f.
-    # История: в v1.0.3 сравнивались dmodel[0] и вершины bsp2bmp; на
-    # warfare.bsp (прод, 2026-10-27) они закономерно не сошлись — dmodel[0]
-    # (браши world-модели, сетка «кратно 32 ± 1»: X[-511..959] Y[-863..671])
-    # не обязан совпадать с bbox ВСЕХ вершин X[-480..928] Y[-832..752]
-    # (суб-модели могут выходить за браши world-модели). Источник границ
-    # переведён на вершины; dmodel[0] — структурная проверка + WARN внутри
-    # make_mapinfo.py.
+    # Кросс-проверка границ: bbox вершин BSP (make_mapinfo, VERTEXES-ламп)
+    # против Bounds из вывода bsp2bmp — это ОДИН И ТОТ ЖЕ набор вершин
+    # (bsp2bmp рендерит по всем рёбрам всех моделей), поэтому совпадение
+    # ОБЯЗАТЕЛЬНО, а расхождение означает сбой захвата вывода или инверсии
+    # Y (в Bounds bsp2bmp ось Y — изображения: мировые Y = (-y_max, -y_min)).
+    # Допуск ±1 — на округление %.0f. Границы карты берутся только из
+    # вершин; dmodel[0] — структурная проверка + WARN внутри make_mapinfo.py.
     if [[ -n "${_bsp_bounds:-}" ]]; then
         read -r _bb_xmin _bb_xmax _bb_ymin _bb_ymax <<< "$_bsp_bounds"
         if (( _bb_xmin < _G_BXMIN - 1 || _bb_xmin > _G_BXMIN + 1 ||
@@ -677,13 +627,12 @@ generate_backdrop() {
 }
 
 # ----------------------------------------------------------------------------
-# Выбор: сгенерировать подложку или проверить существующую (v1.0.7).
+# Выбор: сгенерировать подложку или проверить существующую.
 # Легаси-режим «готовые bmp+json без .bsp» сохранён: без BSP не делаем ни
 # проверок границ, ни перегенерации — только идемпотентный ремонт заголовка.
 # Иначе границы считаются ВСЕГДА (один python-парс), а существующая подложка
-# проверяется по размеру И по контенту: RAW-буфер или «ужатая» подложка
-# прошлых редакций перегенерируются автоматически (раньше здесь был
-# -resize всего буфера — источник дефекта «карта в 5 раз меньше канвы»).
+# проверяется по размеру И по контенту; не прошедшие проверку подложки
+# перегенерируются автоматически.
 # ----------------------------------------------------------------------------
 _G_DIMS_DONE=0
 _G_BMP_FRESH=0
@@ -698,10 +647,10 @@ else
         _dims="$(identify -format '%w %h' "$BMP_PATH" 2>/dev/null)" || _dims=""
         _dims="${_dims// /x}"
         if [[ "$_dims" != "${_RW}x${_RH}" ]]; then
-            log WARN "размер существующей подложки ${_dims:-неизвестен} не совпадает с расчётным ${_RW}x${_RH} — перегенерирую из ${BSP_PATH} (8.7.3, v1.0.7)"
+            log WARN "размер существующей подложки ${_dims:-неизвестен} не совпадает с расчётным ${_RW}x${_RH} — перегенерирую из ${BSP_PATH} (8.7.3)"
             generate_backdrop
         elif ! map_backdrop_content_ok; then
-            log WARN "контент существующей подложки (${_G_CBB:-неизвестен}) не соответствует ожидаемому ~${_G_EW}x${_G_EH} — перегенерирую из ${BSP_PATH} (v1.0.7: ремонт «ужатых» подложек v1.0.6)"
+            log WARN "контент существующей подложки (${_G_CBB:-неизвестен}) не соответствует ожидаемому ~${_G_EW}x${_G_EH} — перегенерирую из ${BSP_PATH} (8.7.3)"
             generate_backdrop
         else
             _fixr="$(fix_bmp_header "$BMP_PATH")" || die 3 "ремонт заголовка BMP не удался: ${BMP_PATH} (8.7.2)"
@@ -735,22 +684,11 @@ if (( BMP_QUIRK == 1 )); then
     log INFO "bmp имеет некорректное поле размера в заголовке (известная особенность исходных подложек); IM6 при этом возвращает ненулевой код — принимаю кадры по факту создания файла"
 fi
 
-# параметры рендера из mapinfo (8.1.7). Ось Y — ПРЯМАЯ (v1.0.8):
-# MIN_Y = minY/scaling, MAX_Y = maxY/scaling — как и для X.
-# ЭРРАТА РЕФЕРЕНСА (v1.0.1..v1.0.7): test.sh автора задавал
-# MIN_Y = -maxY/scaling, MAX_Y = -minY/scaling («зеркало») — по-видимому,
-# компенсируя то, что Bounds Y в отчёте bsp2bmp даёт координаты ИЗОБРАЖЕНИЯ
-# (ось вниз, зеркальны координатам файла BSP). Но данные демки и json
-# (make_mapinfo читает VERTEXES как есть) живут в координатах ФАЙЛА,
-# компенсировать нечего: зеркало сдвигало ВСЕ точки на 2*padding (~21 px)
-# вниз относительно подложки, а точки за южным краем диапазона молча
-# обрезались gnuplot'ом. На проде это выглядело как «точки съехали по одной
-# оси» (warfare, 2026-10-27): маркеры висели ниже южной линии карты
-# (строки 408..415 при крае 407) и НИКОГДА не поднимались выше строки ~30
-# (жёсткое ограничение зеркальных формул) — проверено по 20 кадрам GIF
-# прогона №4 и скриншоту прогона №6. Проверка геометрии на фикстуре
-# (веер-тест: маркер в вершине (0,0), T-22): прямые формулы сажают маркер
-# в пиксель вершины с точностью ~1 px, зеркальные — мимо на ~20 px.
+# параметры рендера из mapinfo (8.1.7). Ось Y — ПРЯМАЯ:
+# MIN_Y = minY/scaling, MAX_Y = maxY/scaling — как и для X. Данные демки
+# и json живут в координатах ФАЙЛА BSP; «зеркалить» Y (как в референсе)
+# нельзя — Bounds Y в отчёте bsp2bmp выражены в координатах ИЗОБРАЖЕНИЯ,
+# а не файла (эррата референса — см. историю v1.0.8 в README).
 PADDING="$(jq -er '.padding | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля padding"
 SCALING="$(jq -er '.scaling | select(type=="number")' "$JSON_PATH" 2>/dev/null)" || die 3 "mapinfo ${JSON_PATH}: нет поля scaling"
 MIN_X="$(jq -r '.minX/.scaling' "$JSON_PATH")"
@@ -790,7 +728,7 @@ log INFO "стартовая gnuplot-проба: OK (палитра и марк�
 # Парсинг демки (FR-15/16/17) — таймер этапа "парсинг"
 # ----------------------------------------------------------------------------
 T_START=$(date +%s)
-T_PARSE_MS=0; T_FRAMES_MS=0; T_GIF_MS=0; T_STATIC_MS=0
+T_PARSE_MS=0; T_FRAMES_MS=0; T_GIF_MS=0
 _t0=$(date +%s%3N)
 
 TEMPLATE_DAT="${RUN_DIR}/template.dat"
@@ -832,15 +770,8 @@ log INFO "mvdparser: ${#data_files[@]} файл(ов) координат"
 _t1=$(date +%s%3N); T_PARSE_MS=$((_t1 - _t0))
 
 # ----------------------------------------------------------------------------
-# MIN_Z / MAX_Z (8.4 с эрратой v1.0.9): общая шкала высоты.
-# ЭРРАТА (2026-10-28, подтверждена владельцем ТЗ): в референсе конвейер
-# `cut|grep -oP "^[-\d]+"|sort -n|uniq -c|grep -oP "\d{2,} \d+"` из-за
-# финального regex "\d+ \d+" (без минуса) ОТБРАСЫВАЛ отрицательные Z —
-# на картах с минусовыми высотами шкала прибивалась к >=0 и вся минусовая
-# часть карты зажималась в плоский синий. Это дефект референса, а не
-# задумка. v1.0.9 учитывает значения ОБАХ знаков; отступление от
-# NFR-5/T-1 (визуальная эквивалентность референсу) в этой части —
-# осознанное.
+# MIN_Z / MAX_Z (8.4): общая шкала высоты. Значения ЛЮБОГО знака
+# (эррата референса — см. историю v1.0.9 в README):
 #   * выживает значение (любого знака) со счётчиком >= Z_OUTLIER_MIN_COUNT
 #     (10 -> счётчик двузначный и более);
 #   * если после фильтра пусто — сырой диапазон всех значений (8.4.3);
@@ -855,7 +786,7 @@ z_range_awk() {
             n = z + 0
             if (!all_set) { all_min = n; all_max = n; all_set = 1 }
             else { if (n < all_min) all_min = n; if (n > all_max) all_max = n }
-            # v1.0.9: минусы больше не отбрасываются (эррата референса 8.4)
+            # значения любого знака (эррата референса 8.4)
             cnt[n]++
         }
         END {
@@ -895,57 +826,12 @@ GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
 
 # ----------------------------------------------------------------------------
-# Статическая карта времени жизни (v1.0.10): границы самого долгого сегмента
-# жизни игрока в .data. Сегментация — по маркерам смерти в колонке 4 (5 =
-# движение, всё прочее = смерть; маркер смерти пишется СЕРИЕЙ одинаковых
-# строк — на реальных .data серии по 10 строк, жизнь закрывается первой
-# строкой серии, сегменты внутри серии имеют длину 1 и в выборе не мешают).
-# Жизнь = от первой точки после предыдущей смерти до точки смерти
-# включительно; хвост после последней смерти (игрок жив на конец демки) —
-# тоже кандидат. «Самая долгая» = максимум точек (замеры равномерны по
-# времени — на том же допущении стоит нарезка chunks, 8.2/8.3); ничья —
-# в пользу первой.
-# ВАЖНО про индексацию (проба на gnuplot 5.4.1): every нумерует точки
-# ПОБЛОЧНО (блоки разделяются пустыми строками), а не по всему файлу.
-# Реальные .data mvdparser имеют одну пустую строку ПЕРЕД данными: первый
-# блок пуст и нумерацию не сдвигает, «абсолютные» индексы корректны.
-# Если найдена пустая строка МЕЖДУ данными — вывод "BLANKS" (вызывающий
-# пропустит статическую карту, а не построит неверную).
-# Вывод: "FSTART FEND" (0-базные индексы точек для every 1::FSTART::FEND),
-# "BLANKS" или "" (нет данных).
-# ----------------------------------------------------------------------------
-longest_life_bounds() {
-    awk '
-        /^$/ { if (idx > 0) saw_blank = 1; next }
-        $1 ~ /^[-+]?[0-9]/ {
-            if (saw_blank) { bad = 1; exit }
-            idx++
-            if (!in_life) { start = idx - 1; in_life = 1 }
-            if ($4 != 5) {
-                len = idx - start
-                if (len > best) { best = len; bs = start; be = idx - 1 }
-                in_life = 0
-            }
-        }
-        END {
-            if (bad) { print "BLANKS"; exit }
-            if (in_life) {
-                len = idx - start
-                if (len > best) { best = len; bs = start; be = idx - 1 }
-            }
-            if (best > 0) printf "%d %d\n", bs, be
-        }
-    ' "$1"
-}
-
-# ----------------------------------------------------------------------------
 # Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"
 # ----------------------------------------------------------------------------
-: > "${RUN_DIR}/players.txt"   # v1.0.9: внутренний журнал, в результат не публикуется
+: > "${RUN_DIR}/players.txt"   # внутренний журнал, в результат не публикуется
 declare -A USED_NAMES=()
 SLOT_NUM=0
 GIF_COUNT=0
-STATIC_COUNT=0
 
 for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     RAW_NICK="$(basename -- "$DATA_FILE" .data)"
@@ -980,27 +866,14 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
         continue
     fi
 
-    # число кадров (8.2/8.3)
-    if [[ "$GIF_MODE" == "chunks" ]]; then
-        if (( DURATION > 0 )); then
-            NUM=$(( (DURATION + CHUNK_SECONDS - 1) / CHUNK_SECONDS ))
-            if (( NUM > MAX_FRAMES_CAP )); then
-                log INFO "число кусков ${NUM} > MAX_FRAMES_CAP=${MAX_FRAMES_CAP} — ограничено"
-                NUM=$MAX_FRAMES_CAP
-            fi
-        else
-            NUM=$MAX_FRAMES
-            log INFO "duration отсутствует/нулевой — fallback MAX_FRAMES=${MAX_FRAMES} (8.3, T-5)"
-        fi
-    else
-        NUM=$MAX_FRAMES
-    fi
+    # число кадров (8.2): interleave — каждый NUM-й замер партии
+    NUM=$MAX_FRAMES
     if (( NUM > L )); then NUM=$L; fi
     if (( NUM < 1 )); then
         log WARN "игрок ${SLOT} ('${RAW_NICK}'): 0 кадров — пропущен"
         continue
     fi
-    log INFO "игрок ${SLOT}: строк данных L=${L}, кадров NUM=${NUM}, режим ${GIF_MODE}"
+    log INFO "игрок ${SLOT}: строк данных L=${L}, кадров NUM=${NUM}"
 
     PDIR="${FRAMES_DIR}/${SLOT}"
     mkdir -p "$PDIR"
@@ -1008,13 +881,7 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     _pf0=$(date +%s%3N)
 
     for (( f = 0; f < NUM; f++ )); do
-        if [[ "$GIF_MODE" == "chunks" ]]; then
-            FSTART=$(( f * L / NUM ))
-            FEND=$(( (f + 1) * L / NUM - 1 ))
-            EVERY="every 1::${FSTART}::${FEND}"
-        else
-            EVERY="every ${NUM}::${f}"
-        fi
+        EVERY="every ${NUM}::${f}"
         FRAME_BASE="${PDIR}/${SLOT}$(printf '%03d' "$f")"
 
         _GV="${GNUPLOT_BASE}; HM_DATA_FILE=$(gp_str "$DATA_FILE")"
@@ -1039,60 +906,6 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     done
 
     _pf1=$(date +%s%3N); T_FRAMES_MS=$((T_FRAMES_MS + _pf1 - _pf0))
-
-    # -------------------------------------------------------------------------
-    # v1.0.10: статическая карта времени жизни (STATIC_MODE) — строится
-    # ОДНОВРЕМЕННО с GIF из тех же .data, той же палитрой/маркерами/формулой
-    # размера (gnuplot-скрипт тот же). Рендер идёт в подкаталог static/, чтобы
-    # файл не попадал под glob сборки GIF "${PDIR}/${SLOT}"*"_map.png".
-    # Блок стоит ДО проверки FR-24: игроку полезна карта жизни, даже если
-    # его GIF не собрался. Сбой статики не фатален (WARN).
-    # -------------------------------------------------------------------------
-    STATIC_NAME=""
-    if [[ "$STATIC_MODE" != "off" ]]; then
-        LF_START=""; LF_END=""
-        if [[ "$STATIC_MODE" == "longest" ]]; then
-            BOUNDS="$(longest_life_bounds "$DATA_FILE")"
-            if [[ "$BOUNDS" == "BLANKS" ]]; then
-                log WARN "игрок ${SLOT} ('${RAW_NICK}'): в .data есть пустые строки между данными (нумерация every поблочная) — статическая карта пропущена (v1.0.10)"
-            elif [[ -z "$BOUNDS" ]]; then
-                log WARN "игрок ${SLOT} ('${RAW_NICK}'): сегменты жизни не найдены — статическая карта пропущена"
-            else
-                read -r LF_START LF_END <<< "$BOUNDS"
-            fi
-        else
-            LF_START=0; LF_END=$((L - 1))
-        fi
-        if [[ -n "$LF_START" ]] && mkdir -p "${PDIR}/static" 2>/dev/null; then
-            SDIR="${PDIR}/static"
-            _ps0=$(date +%s%3N)
-            _GV="${GNUPLOT_BASE}; HM_DATA_FILE=$(gp_str "$DATA_FILE")"
-            _GV+="; HM_OUT_DIR=$(gp_str "$SDIR")"
-            _GV+="; HM_NAME=$(gp_str "${SLOT}life"); HM_FRAME=0"
-            _GV+="; HM_EVERY=$(gp_str "every 1::${LF_START}::${LF_END}")"
-            if gnuplot -e "$_GV" "$GNUPLOT_SCRIPT" 2> "${SDIR}/gnuplot.err" \
-               && [[ -s "${SDIR}/${SLOT}life000.png" ]]; then
-                # FR-22: наложение без -trim, полотно кадра = подложка (как у кадров GIF)
-                composite "${SDIR}/${SLOT}life000.png" "$BMP_PATH" \
-                    "${SDIR}/${SLOT}life000_map.png" 2>> "${SDIR}/composite.err" || true
-                if [[ -s "${SDIR}/${SLOT}life000_map.png" ]]; then
-                    STATIC_NAME="${NICK_S}_life.png"
-                    if cp -- "${SDIR}/${SLOT}life000_map.png" "${STAGE_DIR}/${STATIC_NAME}"; then
-                        STATIC_COUNT=$((STATIC_COUNT + 1))
-                        log INFO "игрок ${SLOT}: статическая карта готова: ${STATIC_NAME} (точки ${LF_START}..${LF_END}, режим ${STATIC_MODE})"
-                    else
-                        log WARN "игрок ${SLOT}: статическую карту не удалось положить в staging — пропущена"
-                        STATIC_NAME=""
-                    fi
-                else
-                    log WARN "игрок ${SLOT} ('${RAW_NICK}'): сбой composite статической карты — пропущена"
-                fi
-            else
-                log WARN "игрок ${SLOT} ('${RAW_NICK}'): сбой gnuplot статической карты — пропущена (FR-24)"
-            fi
-            _ps1=$(date +%s%3N); T_STATIC_MS=$((T_STATIC_MS + _ps1 - _ps0))
-        fi
-    fi
 
     # FR-24: успешно менее половины кадров — GIF не собирается
     if (( FRAME_OK * 2 < NUM )); then
@@ -1119,21 +932,21 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     _pg1=$(date +%s%3N); T_GIF_MS=$((T_GIF_MS + _pg1 - _pg0))
 
     GSIZE="$(stat -c%s "${STAGE_DIR}/${GIF_NAME}" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" "${STATIC_NAME:--}" >> "${RUN_DIR}/players.txt"
+    printf '%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" >> "${RUN_DIR}/players.txt"
     GIF_COUNT=$((GIF_COUNT + 1))
     log INFO "игрок ${SLOT}: GIF готов: ${GIF_NAME} (${GSIZE} байт, кадров ${FRAME_OK}/${NUM}, время $(( (_pg1 - _pf0 + 500) / 1000 )) с)"
 done
 
 if (( GIF_COUNT == 0 )); then
     log ERROR "ни для одного игрока не построен GIF — публикация не выполняется"
-    log INFO "тайминги: парсинг $((T_PARSE_MS / 1000)).$(((T_PARSE_MS % 1000) / 100))с, кадры $((T_FRAMES_MS / 1000)).$(((T_FRAMES_MS % 1000) / 100))с, статика $((T_STATIC_MS / 1000)).$(((T_STATIC_MS % 1000) / 100))с, сборка GIF $((T_GIF_MS / 1000)).$(((T_GIF_MS % 1000) / 100))с"
+    log INFO "тайминги: парсинг $((T_PARSE_MS / 1000)).$(((T_PARSE_MS % 1000) / 100))с, кадры $((T_FRAMES_MS / 1000)).$(((T_FRAMES_MS % 1000) / 100))с, сборка GIF $((T_GIF_MS / 1000)).$(((T_GIF_MS % 1000) / 100))с"
     exit 3
 fi
 
 # ----------------------------------------------------------------------------
 # Публикация (FR-26/27): атомарный mv staging -> result/
 # ----------------------------------------------------------------------------
-# копия demoinfo для провенанса (v1.0.9: управляется RESULT_COPY_DEMOINFO)
+# копия demoinfo для провенанса (управляется RESULT_COPY_DEMOINFO)
 if [[ "${RESULT_COPY_DEMOINFO,,}" == "true" ]]; then
     cp -- "$DEMOINFO_SRC" "${STAGE_DIR}/demoinfo.json" || die 3 "не удалось скопировать demoinfo в staging (FR-26)"
 else
@@ -1153,7 +966,7 @@ if ! mv -- "${STAGE_DIR}" "${RESULT_DIR}/${RNAME}"; then
 fi
 TOTAL_SIZE="$(du -sb "${RESULT_DIR}/${RNAME}" 2>/dev/null | awk '{print $1}')"
 PLAYER_LINES="$(wc -l < "${RUN_DIR}/players.txt" 2>/dev/null || echo 0)"
-log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players: ${PLAYER_LINES}, static: ${STATIC_COUNT})"
+log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players: ${PLAYER_LINES})"
 
 # ----------------------------------------------------------------------------
 # Ретеншн результатов (FR-28) и логов (FR-29)
@@ -1198,8 +1011,8 @@ done < <(find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -name 'heatmap-*.log' \
 # ----------------------------------------------------------------------------
 T_END=$(date +%s)
 _fmt_ms() { echo "$(($1 / 1000)).$(($1 % 1000 / 100))"; }
-log INFO "тайминги: всего $((T_END - T_START)) с; парсинг $( _fmt_ms "$T_PARSE_MS")с; кадры $( _fmt_ms "$T_FRAMES_MS")с; статика $( _fmt_ms "$T_STATIC_MS")с; сборка GIF $( _fmt_ms "$T_GIF_MS")с"
-log INFO "итог: результат result/${RNAME}, GIF ${GIF_COUNT}, статических карт ${STATIC_COUNT}, игроков обработано ${SLOT_NUM}"
+log INFO "тайминги: всего $((T_END - T_START)) с; парсинг $( _fmt_ms "$T_PARSE_MS")с; кадры $( _fmt_ms "$T_FRAMES_MS")с; сборка GIF $( _fmt_ms "$T_GIF_MS")с"
+log INFO "итог: результат result/${RNAME}, GIF ${GIF_COUNT}, игроков обработано ${SLOT_NUM}"
 
 exit 0
 
