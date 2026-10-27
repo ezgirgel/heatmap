@@ -4,7 +4,9 @@
 #
 # Точка входа пост-обработки партии: вызывается mvdsv после матча без
 # аргументов (вся информация о партии — в demoinfo-файле). По каждому игроку
-# строит анимированный GIF перемещений на фоне подложки карты.
+# строит анимированный GIF перемещений на фоне подложки карты; одновременно
+# может строить статическую карту времени жизни <ник>_life.png (v1.0.10,
+# ключ STATIC_MODE: off|longest|full).
 #
 # Вызов:  heatmap.sh [путь-к-demoinfo]
 #         $1 (опционально) перекрывает DEMOINFO_FILE из конфига.
@@ -104,6 +106,12 @@ _hm_tool_path() {
 : "${GIF_DELAY_CS:=5}"
 : "${GIF_LOOP:=0}"
 : "${GIF_OPTIMIZE_FUZZ:=10}"
+# v1.0.10: статические карты времени жизни (строятся одновременно с GIF):
+#   off     — не строить (поведение до v1.0.10);
+#   longest — самое долгое время жизни игрока: от рождения (первая точка
+#             после появления) до смерти (первый маркер смерти серии);
+#   full    — всё присутствие игрока в партии (первая точка — последняя).
+: "${STATIC_MODE:=longest}"
 
 : "${PALETTE_MIN_COLOR:=blue}"
 : "${PALETTE_MAX_COLOR:=red}"
@@ -162,6 +170,10 @@ validate_conf() {
     if [[ "$GIF_MODE" != "interleave" && "$GIF_MODE" != "chunks" ]]; then
         _die_early 1 "конфиг: GIF_MODE='${GIF_MODE}' — допустимо interleave|chunks (FR-6)"
     fi
+    # STATIC_MODE — перечисление (v1.0.10)
+    if [[ "$STATIC_MODE" != "off" && "$STATIC_MODE" != "longest" && "$STATIC_MODE" != "full" ]]; then
+        _die_early 1 "конфиг: STATIC_MODE='${STATIC_MODE}' — допустимо off|longest|full (FR-6)"
+    fi
     # логические ключи
     local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO)
     for key in "${bool_keys[@]}"; do
@@ -216,7 +228,7 @@ check_unknown_keys() {
         MVDPARSER_BIN FRAGFILE TEMPLATE_TPL GNUPLOT_SCRIPT
         BSP2BMP_BIN BSP2BMP_ARGS
         RESULT_DIR LOG_DIR TMP_BASE LOCK_FILE TOOLS_DIR
-        GIF_MODE CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES
+        GIF_MODE CHUNK_SECONDS MAX_FRAMES MAX_FRAMES_CAP MIN_DATA_LINES STATIC_MODE
         GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
         MARKER_MOVE_TYPE MARKER_MOVE_SIZE MARKER_DEATH_TYPE MARKER_DEATH_SIZE
@@ -778,7 +790,7 @@ log INFO "стартовая gnuplot-проба: OK (палитра и марк�
 # Парсинг демки (FR-15/16/17) — таймер этапа "парсинг"
 # ----------------------------------------------------------------------------
 T_START=$(date +%s)
-T_PARSE_MS=0; T_FRAMES_MS=0; T_GIF_MS=0
+T_PARSE_MS=0; T_FRAMES_MS=0; T_GIF_MS=0; T_STATIC_MS=0
 _t0=$(date +%s%3N)
 
 TEMPLATE_DAT="${RUN_DIR}/template.dat"
@@ -883,12 +895,57 @@ GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
 
 # ----------------------------------------------------------------------------
+# Статическая карта времени жизни (v1.0.10): границы самого долгого сегмента
+# жизни игрока в .data. Сегментация — по маркерам смерти в колонке 4 (5 =
+# движение, всё прочее = смерть; маркер смерти пишется СЕРИЕЙ одинаковых
+# строк — на реальных .data серии по 10 строк, жизнь закрывается первой
+# строкой серии, сегменты внутри серии имеют длину 1 и в выборе не мешают).
+# Жизнь = от первой точки после предыдущей смерти до точки смерти
+# включительно; хвост после последней смерти (игрок жив на конец демки) —
+# тоже кандидат. «Самая долгая» = максимум точек (замеры равномерны по
+# времени — на том же допущении стоит нарезка chunks, 8.2/8.3); ничья —
+# в пользу первой.
+# ВАЖНО про индексацию (проба на gnuplot 5.4.1): every нумерует точки
+# ПОБЛОЧНО (блоки разделяются пустыми строками), а не по всему файлу.
+# Реальные .data mvdparser имеют одну пустую строку ПЕРЕД данными: первый
+# блок пуст и нумерацию не сдвигает, «абсолютные» индексы корректны.
+# Если найдена пустая строка МЕЖДУ данными — вывод "BLANKS" (вызывающий
+# пропустит статическую карту, а не построит неверную).
+# Вывод: "FSTART FEND" (0-базные индексы точек для every 1::FSTART::FEND),
+# "BLANKS" или "" (нет данных).
+# ----------------------------------------------------------------------------
+longest_life_bounds() {
+    awk '
+        /^$/ { if (idx > 0) saw_blank = 1; next }
+        $1 ~ /^[-+]?[0-9]/ {
+            if (saw_blank) { bad = 1; exit }
+            idx++
+            if (!in_life) { start = idx - 1; in_life = 1 }
+            if ($4 != 5) {
+                len = idx - start
+                if (len > best) { best = len; bs = start; be = idx - 1 }
+                in_life = 0
+            }
+        }
+        END {
+            if (bad) { print "BLANKS"; exit }
+            if (in_life) {
+                len = idx - start
+                if (len > best) { best = len; bs = start; be = idx - 1 }
+            }
+            if (best > 0) printf "%d %d\n", bs, be
+        }
+    ' "$1"
+}
+
+# ----------------------------------------------------------------------------
 # Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"
 # ----------------------------------------------------------------------------
 : > "${RUN_DIR}/players.txt"   # v1.0.9: внутренний журнал, в результат не публикуется
 declare -A USED_NAMES=()
 SLOT_NUM=0
 GIF_COUNT=0
+STATIC_COUNT=0
 
 for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     RAW_NICK="$(basename -- "$DATA_FILE" .data)"
@@ -983,6 +1040,60 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
 
     _pf1=$(date +%s%3N); T_FRAMES_MS=$((T_FRAMES_MS + _pf1 - _pf0))
 
+    # -------------------------------------------------------------------------
+    # v1.0.10: статическая карта времени жизни (STATIC_MODE) — строится
+    # ОДНОВРЕМЕННО с GIF из тех же .data, той же палитрой/маркерами/формулой
+    # размера (gnuplot-скрипт тот же). Рендер идёт в подкаталог static/, чтобы
+    # файл не попадал под glob сборки GIF "${PDIR}/${SLOT}"*"_map.png".
+    # Блок стоит ДО проверки FR-24: игроку полезна карта жизни, даже если
+    # его GIF не собрался. Сбой статики не фатален (WARN).
+    # -------------------------------------------------------------------------
+    STATIC_NAME=""
+    if [[ "$STATIC_MODE" != "off" ]]; then
+        LF_START=""; LF_END=""
+        if [[ "$STATIC_MODE" == "longest" ]]; then
+            BOUNDS="$(longest_life_bounds "$DATA_FILE")"
+            if [[ "$BOUNDS" == "BLANKS" ]]; then
+                log WARN "игрок ${SLOT} ('${RAW_NICK}'): в .data есть пустые строки между данными (нумерация every поблочная) — статическая карта пропущена (v1.0.10)"
+            elif [[ -z "$BOUNDS" ]]; then
+                log WARN "игрок ${SLOT} ('${RAW_NICK}'): сегменты жизни не найдены — статическая карта пропущена"
+            else
+                read -r LF_START LF_END <<< "$BOUNDS"
+            fi
+        else
+            LF_START=0; LF_END=$((L - 1))
+        fi
+        if [[ -n "$LF_START" ]] && mkdir -p "${PDIR}/static" 2>/dev/null; then
+            SDIR="${PDIR}/static"
+            _ps0=$(date +%s%3N)
+            _GV="${GNUPLOT_BASE}; HM_DATA_FILE=$(gp_str "$DATA_FILE")"
+            _GV+="; HM_OUT_DIR=$(gp_str "$SDIR")"
+            _GV+="; HM_NAME=$(gp_str "${SLOT}life"); HM_FRAME=0"
+            _GV+="; HM_EVERY=$(gp_str "every 1::${LF_START}::${LF_END}")"
+            if gnuplot -e "$_GV" "$GNUPLOT_SCRIPT" 2> "${SDIR}/gnuplot.err" \
+               && [[ -s "${SDIR}/${SLOT}life000.png" ]]; then
+                # FR-22: наложение без -trim, полотно кадра = подложка (как у кадров GIF)
+                composite "${SDIR}/${SLOT}life000.png" "$BMP_PATH" \
+                    "${SDIR}/${SLOT}life000_map.png" 2>> "${SDIR}/composite.err" || true
+                if [[ -s "${SDIR}/${SLOT}life000_map.png" ]]; then
+                    STATIC_NAME="${NICK_S}_life.png"
+                    if cp -- "${SDIR}/${SLOT}life000_map.png" "${STAGE_DIR}/${STATIC_NAME}"; then
+                        STATIC_COUNT=$((STATIC_COUNT + 1))
+                        log INFO "игрок ${SLOT}: статическая карта готова: ${STATIC_NAME} (точки ${LF_START}..${LF_END}, режим ${STATIC_MODE})"
+                    else
+                        log WARN "игрок ${SLOT}: статическую карту не удалось положить в staging — пропущена"
+                        STATIC_NAME=""
+                    fi
+                else
+                    log WARN "игрок ${SLOT} ('${RAW_NICK}'): сбой composite статической карты — пропущена"
+                fi
+            else
+                log WARN "игрок ${SLOT} ('${RAW_NICK}'): сбой gnuplot статической карты — пропущена (FR-24)"
+            fi
+            _ps1=$(date +%s%3N); T_STATIC_MS=$((T_STATIC_MS + _ps1 - _ps0))
+        fi
+    fi
+
     # FR-24: успешно менее половины кадров — GIF не собирается
     if (( FRAME_OK * 2 < NUM )); then
         log WARN "игрок ${SLOT} ('${RAW_NICK}'): успешных кадров ${FRAME_OK} из ${NUM} (< половины) — GIF не собирается (FR-24)"
@@ -1008,14 +1119,14 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     _pg1=$(date +%s%3N); T_GIF_MS=$((T_GIF_MS + _pg1 - _pg0))
 
     GSIZE="$(stat -c%s "${STAGE_DIR}/${GIF_NAME}" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" >> "${RUN_DIR}/players.txt"
+    printf '%s\t%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" "${STATIC_NAME:--}" >> "${RUN_DIR}/players.txt"
     GIF_COUNT=$((GIF_COUNT + 1))
     log INFO "игрок ${SLOT}: GIF готов: ${GIF_NAME} (${GSIZE} байт, кадров ${FRAME_OK}/${NUM}, время $(( (_pg1 - _pf0 + 500) / 1000 )) с)"
 done
 
 if (( GIF_COUNT == 0 )); then
     log ERROR "ни для одного игрока не построен GIF — публикация не выполняется"
-    log INFO "тайминги: парсинг $((T_PARSE_MS / 1000)).$(((T_PARSE_MS % 1000) / 100))с, кадры $((T_FRAMES_MS / 1000)).$(((T_FRAMES_MS % 1000) / 100))с, сборка GIF $((T_GIF_MS / 1000)).$(((T_GIF_MS % 1000) / 100))с"
+    log INFO "тайминги: парсинг $((T_PARSE_MS / 1000)).$(((T_PARSE_MS % 1000) / 100))с, кадры $((T_FRAMES_MS / 1000)).$(((T_FRAMES_MS % 1000) / 100))с, статика $((T_STATIC_MS / 1000)).$(((T_STATIC_MS % 1000) / 100))с, сборка GIF $((T_GIF_MS / 1000)).$(((T_GIF_MS % 1000) / 100))с"
     exit 3
 fi
 
@@ -1042,7 +1153,7 @@ if ! mv -- "${STAGE_DIR}" "${RESULT_DIR}/${RNAME}"; then
 fi
 TOTAL_SIZE="$(du -sb "${RESULT_DIR}/${RNAME}" 2>/dev/null | awk '{print $1}')"
 PLAYER_LINES="$(wc -l < "${RUN_DIR}/players.txt" 2>/dev/null || echo 0)"
-log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players: ${PLAYER_LINES})"
+log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players: ${PLAYER_LINES}, static: ${STATIC_COUNT})"
 
 # ----------------------------------------------------------------------------
 # Ретеншн результатов (FR-28) и логов (FR-29)
@@ -1087,8 +1198,8 @@ done < <(find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -name 'heatmap-*.log' \
 # ----------------------------------------------------------------------------
 T_END=$(date +%s)
 _fmt_ms() { echo "$(($1 / 1000)).$(($1 % 1000 / 100))"; }
-log INFO "тайминги: всего $((T_END - T_START)) с; парсинг $( _fmt_ms "$T_PARSE_MS")с; кадры $( _fmt_ms "$T_FRAMES_MS")с; сборка GIF $( _fmt_ms "$T_GIF_MS")с"
-log INFO "итог: результат result/${RNAME}, GIF ${GIF_COUNT}, игроков обработано ${SLOT_NUM}"
+log INFO "тайминги: всего $((T_END - T_START)) с; парсинг $( _fmt_ms "$T_PARSE_MS")с; кадры $( _fmt_ms "$T_FRAMES_MS")с; статика $( _fmt_ms "$T_STATIC_MS")с; сборка GIF $( _fmt_ms "$T_GIF_MS")с"
+log INFO "итог: результат result/${RNAME}, GIF ${GIF_COUNT}, статических карт ${STATIC_COUNT}, игроков обработано ${SLOT_NUM}"
 
 exit 0
 
