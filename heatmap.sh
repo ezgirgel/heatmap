@@ -112,6 +112,11 @@ _hm_tool_path() {
 : "${MARKER_MOVE_SIZE:=5}"
 : "${MARKER_DEATH_TYPE:=2}"
 : "${MARKER_DEATH_SIZE:=2}"
+# v1.0.9: концы формулы высоты для размера маркера:
+#   size = MIN_MARKER_SIZE + t*(MAX_MARKER_SIZE-MIN_MARKER_SIZE),
+#   t = (z-MIN_Z)/(MAX_Z-MIN_Z)  (старые MARKER_*_SIZE по-прежнему игнорируются)
+: "${MIN_MARKER_SIZE:=0.5}"
+: "${MAX_MARKER_SIZE:=3.0}"
 : "${BLANK_MAP_NEGATE:=false}"
 : "${Z_OUTLIER_MIN_COUNT:=10}"
 : "${MAPINFO_PADDING:=10}"
@@ -122,6 +127,8 @@ _hm_tool_path() {
 : "${LOG_RETENTION_DAYS:=30}"
 : "${LOCK_WAIT_SEC:=1800}"
 : "${KEEP_TMP_ON_FAIL:=true}"
+# v1.0.9: класть ли копию demoinfo.json в каталог результата (провенанс)
+: "${RESULT_COPY_DEMOINFO:=true}"
 : "${NICE_LEVEL:=}"
 
 # ----------------------------------------------------------------------------
@@ -156,7 +163,7 @@ validate_conf() {
         _die_early 1 "конфиг: GIF_MODE='${GIF_MODE}' — допустимо interleave|chunks (FR-6)"
     fi
     # логические ключи
-    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL)
+    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO)
     for key in "${bool_keys[@]}"; do
         local v="${!key,,}"
         if [[ "$v" != "true" && "$v" != "false" ]]; then
@@ -178,6 +185,15 @@ validate_conf() {
             _die_early 1 "конфиг: ключ ${key}='${!key}' — должен быть > 0 (FR-6)"
         fi
     done
+    # v1.0.9: концы формулы высоты — числа > 0, MIN <= MAX (7.3, FR-6)
+    for key in MIN_MARKER_SIZE MAX_MARKER_SIZE; do
+        if ! is_num "${!key}" || ! awk -v v="${!key}" 'BEGIN{exit !(v > 0)}'; then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — число > 0 (pointsize, FR-6)"
+        fi
+    done
+    if ! awk -v a="$MIN_MARKER_SIZE" -v b="$MAX_MARKER_SIZE" 'BEGIN{exit !(a <= b)}'; then
+        _die_early 1 "конфиг: MIN_MARKER_SIZE=${MIN_MARKER_SIZE} > MAX_MARKER_SIZE=${MAX_MARKER_SIZE} (FR-6)"
+    fi
     # NICE_LEVEL: пусто или 0..19
     if [[ -n "$NICE_LEVEL" ]] && { ! is_int "$NICE_LEVEL" || (( 10#$NICE_LEVEL > 19 )); }; then
         _die_early 1 "конфиг: NICE_LEVEL='${NICE_LEVEL}' — пусто или целое 0..19 (FR-6)"
@@ -204,9 +220,10 @@ check_unknown_keys() {
         GIF_DELAY_CS GIF_LOOP GIF_OPTIMIZE_FUZZ
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
         MARKER_MOVE_TYPE MARKER_MOVE_SIZE MARKER_DEATH_TYPE MARKER_DEATH_SIZE
+        MIN_MARKER_SIZE MAX_MARKER_SIZE RESULT_COPY_DEMOINFO
         Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
         RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
-        LOCK_WAIT_SEC KEEP_TMP_ON_FAIL NICE_LEVEL
+        LOCK_WAIT_SEC KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO NICE_LEVEL
     )
     for k in "${known_keys[@]}"; do known["$k"]=1; done
     # «base» исполняет такой же однотактный пайплайн, как source в «full» —
@@ -320,13 +337,17 @@ gp_str() {
 }
 
 # ----------------------------------------------------------------------------
-# Trap выхода: уборка run-каталога с учётом KEEP_TMP_ON_FAIL (FR-30)
+# Trap выхода: уборка run-каталога (FR-30). v1.0.9 «умная уборка»: при сбое
+# KEEP_TMP_ON_FAIL=true сохраняет run-каталог ТОЛЬКО если в нём есть файлы
+# (есть что разбирать); пустой каталог (сбой до парсинга/рендера) удаляется
+# всегда — пустые frames/XY_data/stage не копятся в tmp.
 # ----------------------------------------------------------------------------
 RUN_DIR=""
 hm_on_exit() {
     local rc="$1" || true
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
-        if [[ "$KEEP_TMP_ON_FAIL" == "true" && "$rc" != "0" ]]; then
+        if [[ "$KEEP_TMP_ON_FAIL" == "true" && "$rc" != "0" ]] \
+           && [[ -n "$(find "$RUN_DIR" -type f -print -quit 2>/dev/null)" ]]; then
             log INFO "run-каталог сохранён для разбора (KEEP_TMP_ON_FAIL=true): ${RUN_DIR}"
         else
             rm -rf -- "$RUN_DIR" 2>/dev/null || true
@@ -741,6 +762,7 @@ _GNUPLOT_VARS+="; HM_NAME=$(gp_str "probe"); HM_FRAME=0; HM_EVERY=\"\""
 _GNUPLOT_VARS+="; HM_MIN_X=-20; HM_MAX_X=20; HM_MIN_Y=-20; HM_MAX_Y=20"
 _GNUPLOT_VARS+="; HM_MIN_Z=-1; HM_MAX_Z=1; HM_IMG_WIDTH=64; HM_IMG_HEIGHT=64"
 _GNUPLOT_VARS+="; HM_PADDING=1; HM_SCALING=1"
+_GNUPLOT_VARS+="; HM_MIN_MARKER_SIZE=${MIN_MARKER_SIZE}; HM_MAX_MARKER_SIZE=${MAX_MARKER_SIZE}"
 _GNUPLOT_VARS+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYPE}"
 _GNUPLOT_VARS+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
 _GNUPLOT_VARS+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
@@ -798,14 +820,18 @@ log INFO "mvdparser: ${#data_files[@]} файл(ов) координат"
 _t1=$(date +%s%3N); T_PARSE_MS=$((_t1 - _t0))
 
 # ----------------------------------------------------------------------------
-# MIN_Z / MAX_Z (8.4): общая шкала высоты, поведение как в референсе.
-# Реплицируется конвейер `cut|grep -oP "^[-\d]+"|sort -n|uniq -c|
-# grep -oP "\d{2,} \d+"`:
-#   * выживает значение со счётчиком >= Z_OUTLIER_MIN_COUNT (10 -> "\d{2,}");
-#   * значение должно быть НЕОТРИЦАТЕЛЬНЫМ ("\d+" после пробела не матчит
-#     знак минус) — побочный эффект regex референса, обязателен для
-#     визуальной эквивалентности палитры (NFR-5, T-1);
-#   * если после фильтра пусто — без фильтра (8.4.3);
+# MIN_Z / MAX_Z (8.4 с эрратой v1.0.9): общая шкала высоты.
+# ЭРРАТА (2026-10-28, подтверждена владельцем ТЗ): в референсе конвейер
+# `cut|grep -oP "^[-\d]+"|sort -n|uniq -c|grep -oP "\d{2,} \d+"` из-за
+# финального regex "\d+ \d+" (без минуса) ОТБРАСЫВАЛ отрицательные Z —
+# на картах с минусовыми высотами шкала прибивалась к >=0 и вся минусовая
+# часть карты зажималась в плоский синий. Это дефект референса, а не
+# задумка. v1.0.9 учитывает значения ОБАХ знаков; отступление от
+# NFR-5/T-1 (визуальная эквивалентность референсу) в этой части —
+# осознанное.
+#   * выживает значение (любого знака) со счётчиком >= Z_OUTLIER_MIN_COUNT
+#     (10 -> счётчик двузначный и более);
+#   * если после фильтра пусто — сырой диапазон всех значений (8.4.3);
 #   * MIN == MAX -> расширить на 1 (8.4.4).
 # ----------------------------------------------------------------------------
 z_range_awk() {
@@ -817,7 +843,7 @@ z_range_awk() {
             n = z + 0
             if (!all_set) { all_min = n; all_max = n; all_set = 1 }
             else { if (n < all_min) all_min = n; if (n > all_max) all_max = n }
-            if (z !~ /^[0-9]+$/) next          # реплика "\d+ \d+": без минуса
+            # v1.0.9: минусы больше не отбрасываются (эррата референса 8.4)
             cnt[n]++
         }
         END {
@@ -850,6 +876,7 @@ GNUPLOT_BASE="HM_MIN_X=${MIN_X}; HM_MAX_X=${MAX_X}; HM_MIN_Y=${MIN_Y}; HM_MAX_Y=
 GNUPLOT_BASE+="; HM_MIN_Z=${MIN_Z}; HM_MAX_Z=${MAX_Z}"
 GNUPLOT_BASE+="; HM_IMG_WIDTH=${IMG_WIDTH}; HM_IMG_HEIGHT=${IMG_HEIGHT}"
 GNUPLOT_BASE+="; HM_PADDING=${PADDING}; HM_SCALING=${SCALING}"
+GNUPLOT_BASE+="; HM_MIN_MARKER_SIZE=${MIN_MARKER_SIZE}; HM_MAX_MARKER_SIZE=${MAX_MARKER_SIZE}"
 GNUPLOT_BASE+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYPE}"
 GNUPLOT_BASE+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
 GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
@@ -858,7 +885,7 @@ GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
 # ----------------------------------------------------------------------------
 # Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"
 # ----------------------------------------------------------------------------
-: > "${STAGE_DIR}/players.txt"
+: > "${RUN_DIR}/players.txt"   # v1.0.9: внутренний журнал, в результат не публикуется
 declare -A USED_NAMES=()
 SLOT_NUM=0
 GIF_COUNT=0
@@ -981,7 +1008,7 @@ for DATA_FILE in ${data_files[@]+"${data_files[@]}"}; do
     _pg1=$(date +%s%3N); T_GIF_MS=$((T_GIF_MS + _pg1 - _pg0))
 
     GSIZE="$(stat -c%s "${STAGE_DIR}/${GIF_NAME}" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" >> "${STAGE_DIR}/players.txt"
+    printf '%s\t%s\t%s\n' "$SLOT" "$RAW_NICK" "$GIF_NAME" >> "${RUN_DIR}/players.txt"
     GIF_COUNT=$((GIF_COUNT + 1))
     log INFO "игрок ${SLOT}: GIF готов: ${GIF_NAME} (${GSIZE} байт, кадров ${FRAME_OK}/${NUM}, время $(( (_pg1 - _pf0 + 500) / 1000 )) с)"
 done
@@ -995,8 +1022,12 @@ fi
 # ----------------------------------------------------------------------------
 # Публикация (FR-26/27): атомарный mv staging -> result/
 # ----------------------------------------------------------------------------
-# копия demoinfo для провенанса
-cp -- "$DEMOINFO_SRC" "${STAGE_DIR}/demoinfo.json" || die 3 "не удалось скопировать demoinfo в staging (FR-26)"
+# копия demoinfo для провенанса (v1.0.9: управляется RESULT_COPY_DEMOINFO)
+if [[ "${RESULT_COPY_DEMOINFO,,}" == "true" ]]; then
+    cp -- "$DEMOINFO_SRC" "${STAGE_DIR}/demoinfo.json" || die 3 "не удалось скопировать demoinfo в staging (FR-26)"
+else
+    log INFO "RESULT_COPY_DEMOINFO=false — копия demoinfo.json в результат не добавляется"
+fi
 
 mkdir -p "$RESULT_DIR" || die 3 "не удалось создать ${RESULT_DIR}"
 # повторная проверка уникальности имени непосредственно перед публикацией
@@ -1010,7 +1041,8 @@ if ! mv -- "${STAGE_DIR}" "${RESULT_DIR}/${RNAME}"; then
     die 3 "публикация не удалась: mv ${STAGE_DIR} -> ${RESULT_DIR}/${RNAME} (FR-26)"
 fi
 TOTAL_SIZE="$(du -sb "${RESULT_DIR}/${RNAME}" 2>/dev/null | awk '{print $1}')"
-log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players.txt: $(wc -l < "${RESULT_DIR}/${RNAME}/players.txt") строк)"
+PLAYER_LINES="$(wc -l < "${RUN_DIR}/players.txt" 2>/dev/null || echo 0)"
+log INFO "опубликован каталог результата: result/${RNAME} (${TOTAL_SIZE} байт, GIF: ${GIF_COUNT}, players: ${PLAYER_LINES})"
 
 # ----------------------------------------------------------------------------
 # Ретеншн результатов (FR-28) и логов (FR-29)
