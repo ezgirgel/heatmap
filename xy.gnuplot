@@ -7,7 +7,7 @@
 #   числовые:  HM_FRAME, HM_MIN_X, HM_MAX_X, HM_MIN_Y, HM_MAX_Y,
 #              HM_MIN_Z, HM_MAX_Z, HM_IMG_WIDTH, HM_IMG_HEIGHT,
 #              HM_PADDING, HM_SCALING,
-#              HM_PS_MOVE, HM_PS_DEATH, HM_PT_MOVE, HM_PT_DEATH
+#              HM_PT_MOVE, HM_PT_DEATH
 #
 # Ник игрока в gnuplot не передаётся (только слот pNNN) — защита от инъекций
 # через кавычки/спецсимволы в нике (FR-20).
@@ -38,10 +38,10 @@ PADDING    = real(HM_PADDING)
 SCALING    = real(HM_SCALING)
 
 # маркеры (7.3): тип события в колонке 4 данных не зависит от настроек
-# (5 = движение, 2 = смерть); выбор фигурки/размера — явные тернарные
-# выражения в using (FR-35)
-PS_MOVE  = real(HM_PS_MOVE)
-PS_DEATH = real(HM_PS_DEATH)
+# (5 = движение, 2 = смерть); «фигурка» — явное тернарное выражение в
+# using (FR-35). Размер маркера в v1.0.6 НЕ настраивается — он задаётся
+# формулой высоты (как в референсе), поэтому PS_MOVE/PS_DEATH убраны;
+# ключи MARKER_*_SIZE в конфиге устарели (принимаются без WARN).
 PT_MOVE  = int(HM_PT_MOVE)
 PT_DEATH = int(HM_PT_DEATH)
 
@@ -84,11 +84,22 @@ eval PCMD
 # --- кадр (8.8.2) -------------------------------------------------------------
 # колонки данных: 1=X 2=Y 3=Z 4=тип события (5 движение / 2 смерть)
 #
-# ВАЖНО (подводный камень №11 ТЗ, проверено на gnuplot 5.4 patchlevel 1):
-# для "with points pointsize var pointtype var lt palette" gnuplot 5.4
-# распределяет дополнительные using-колонки как
+# ВАЖНО (порядок переменных колонок, установлен экспериментально на gnuplot
+# 5.4 patchlevel 1 — T-20): для "with points pointsize var pointtype var
+# lt palette" дополнительные using-колонки потребляются как
 #       x : y : pointTYPE : pointSIZE : colorbox
-# (в старых версиях порядок был x:y:cb:size). Поэтому явные тернарные
-# выражения стоят в порядке: TYPE, SIZE, cb-нормализация высоты.
-CMD = sprintf("plot '%s' %s using ($1/SCALING):($2/SCALING):(column(4)==5 ? PT_MOVE : PT_DEATH):(column(4)==5 ? PS_MOVE : PS_DEATH):(((column(3)-MIN_Z)/(MAX_Z-MIN_Z))+0.5) with points pointsize var pointtype var lt palette", DATA_FILE, EVERY)
+# Референсный xy.gnuplot (его команда: formula, $4, $3) написан под СТАРЫЙ
+# gnuplot (порядок size:type:cb) и на 5.4 ломается — эталонные GIF сняты
+# старой версией. Правильная раскладка для 5.4:
+#       TYPE — тернарник из конфига (FR-35),
+#       SIZE — формула высоты ((z-MIN_Z)/(MAX_Z-MIN_Z))+0.5, т.е. 0.5..1.5
+#             («чем ниже, тем меньше», как в референсе; MARKER_*_SIZE
+#             устарели — см. heatmap.conf),
+#       CB — сырой Z (при cbrange [MIN_Z:MAX_Z] палитра blue->red).
+# История дефекта v1.0.x: порядок был верный, но содержимое слотов — нет:
+# в SIZE попадала константа MARKER_*_SIZE (точки в ~5 раз крупнее), а в CB —
+# нормированное значение 0.5..1.5 при cbrange [0:272] (градиент сжимался
+# в синий). На схемах с PT≡PS (5/5 и 2/2) это не бросалось в глаза и не
+# ловилось до реального прогона warfare (2026-10-27).
+CMD = sprintf("plot '%s' %s using ($1/SCALING):($2/SCALING):(column(4)==5 ? PT_MOVE : PT_DEATH):(((column(3)-MIN_Z)/(MAX_Z-MIN_Z))+0.5):(column(3)) with points pointsize var pointtype var lt palette", DATA_FILE, EVERY)
 eval CMD
