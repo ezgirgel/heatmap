@@ -113,6 +113,8 @@ _hm_tool_path() {
 #   t = (z-MIN_Z)/(MAX_Z-MIN_Z)
 : "${MIN_MARKER_SIZE:=0.7}"
 : "${MAX_MARKER_SIZE:=1.5}"
+# иконки предметов: точки спавна оружия/брони из entity lump карты (v1.0.12)
+: "${SHOW_ITEMS:=true}"
 : "${BLANK_MAP_NEGATE:=false}"
 : "${Z_OUTLIER_MIN_COUNT:=10}"
 : "${MAPINFO_PADDING:=10}"
@@ -155,7 +157,7 @@ validate_conf() {
         fi
     done
     # логические ключи
-    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO)
+    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO SHOW_ITEMS)
     for key in "${bool_keys[@]}"; do
         local v="${!key,,}"
         if [[ "$v" != "true" && "$v" != "false" ]]; then
@@ -205,6 +207,7 @@ check_unknown_keys() {
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
         MARKER_MOVE_TYPE MARKER_DEATH_TYPE
         MIN_MARKER_SIZE MAX_MARKER_SIZE RESULT_COPY_DEMOINFO
+        SHOW_ITEMS
         Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
         RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
         LOCK_WAIT_SEC KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO NICE_LEVEL
@@ -671,6 +674,41 @@ if [[ ! -f "$JSON_PATH" ]]; then
     }
 fi
 
+# ----------------------------------------------------------------------------
+# Иконки предметов (SHOW_ITEMS, v1.0.12): точки спавна оружия/брони из
+# entity lump карты. Кэш blank_map/<map>.items (X Y Z группа метка):
+# генерируется при отсутствии или когда .bsp новее кэша. Любая проблема
+# (нет .bsp, сбой экстрактора) — только WARN: иконки — украшение, партия
+# рендерится без них. Пустой файл (на карте нет подходящих предметов) —
+# норма: рисуются только маркеры.
+# ----------------------------------------------------------------------------
+ITEMS_GNUPLOT=""
+if [[ "$SHOW_ITEMS" == "true" ]]; then
+    ITEMS_PATH="${BLANK_MAP_DIR}/${MAP}.items"
+    EXTRACT_ITEMS="${TOOLS_DIR}/extract_items.py"
+    if [[ ! -f "$BSP_PATH" ]]; then
+        log WARN "иконки предметов: нет исходника карты ${BSP_PATH} — иконки не рисуются"
+    elif [[ ! -f "$EXTRACT_ITEMS" ]]; then
+        log WARN "иконки предметов: экстрактор не найден: ${EXTRACT_ITEMS} — иконки не рисуются"
+    elif [[ ! -f "$ITEMS_PATH" || "$BSP_PATH" -nt "$ITEMS_PATH" ]]; then
+        log INFO "генерация точек предметов: ${BSP_PATH} -> ${ITEMS_PATH}"
+        if ! python3 "$EXTRACT_ITEMS" "$BSP_PATH" --output "$ITEMS_PATH"; then
+            log WARN "extract_items.py не удался — иконки не рисуются"
+        fi
+    else
+        log INFO "иконки предметов: кэш ${ITEMS_PATH} актуален"
+    fi
+    if [[ -s "${ITEMS_PATH:-}" ]]; then
+        ITEMS_GNUPLOT="$ITEMS_PATH"
+        ITEM_COUNT="$(wc -l < "$ITEMS_PATH")"
+        log INFO "иконки предметов: ${ITEM_COUNT} шт. (${ITEMS_PATH})"
+    else
+        log INFO "иконки предметов: 0 шт. — рисуются только маркеры"
+    fi
+else
+    log INFO "SHOW_ITEMS=false — иконки предметов отключены"
+fi
+
 # FR-14: проверка согласованности размеров bmp и json
 BMP_W="$(identify -format '%w' "$BMP_PATH" 2>/dev/null || true)"
 BMP_H="$(identify -format '%h' "$BMP_PATH" 2>/dev/null || true)"
@@ -702,10 +740,13 @@ log INFO "рендер: ${IMG_WIDTH}x${IMG_HEIGHT}, padding=${PADDING}, scaling=
 
 # ----------------------------------------------------------------------------
 # Стартовая gnuplot-проба (FR-36): мини-рендер с настроенной палитрой/маркерами
+# и метками предметов (синтетический probe.items — синтаксис items-plot
+# проверяется при любом SHOW_ITEMS/наполнении карты)
 # ----------------------------------------------------------------------------
 PROBE_DIR="${RUN_DIR}/probe"
 mkdir -p "$PROBE_DIR"
 printf '0 0 0 5\n10 0 0 2\n-10 0 0 5\n' > "${PROBE_DIR}/probe.data"
+printf '5 5 0 1 RL\n-5 -5 0 2 YA\n' > "${PROBE_DIR}/probe.items"
 _GNUPLOT_VARS="HM_DATA_FILE=$(gp_str "${PROBE_DIR}/probe.data")"
 _GNUPLOT_VARS+="; HM_OUT_DIR=$(gp_str "$PROBE_DIR")"
 _GNUPLOT_VARS+="; HM_NAME=$(gp_str "probe"); HM_FRAME=0; HM_EVERY=\"\""
@@ -717,6 +758,7 @@ _GNUPLOT_VARS+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYP
 _GNUPLOT_VARS+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
 _GNUPLOT_VARS+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 _GNUPLOT_VARS+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
+_GNUPLOT_VARS+="; HM_ITEMS_FILE=$(gp_str "${PROBE_DIR}/probe.items")"
 if ! gnuplot -e "$_GNUPLOT_VARS" "$GNUPLOT_SCRIPT" 2> "${PROBE_DIR}/probe.err"; then
     log ERROR "стартовая gnuplot-проба не прошла — проверьте PALETTE_*/MARKER_* в конфиге (FR-36):"
     sed 's/^/    /' "${PROBE_DIR}/probe.err" 2>/dev/null || true
@@ -824,6 +866,8 @@ GNUPLOT_BASE+="; HM_PT_MOVE=${MARKER_MOVE_TYPE}; HM_PT_DEATH=${MARKER_DEATH_TYPE
 GNUPLOT_BASE+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
 GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
+# иконки предметов: пустая строка = xy.gnuplot рисует только маркеры
+GNUPLOT_BASE+="; HM_ITEMS_FILE=$(gp_str "$ITEMS_GNUPLOT")"
 
 # ----------------------------------------------------------------------------
 # Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"
