@@ -11,6 +11,10 @@
 #              HM_MIN_MARKER_SIZE, HM_MAX_MARKER_SIZE
 #   строковые: HM_ITEMS_FILE — файл точек предметов (пустая строка = иконки
 #              не рисуются; SHOW_ITEMS в heatmap.conf)
+#              HM_ITEM_COLOR_<МЕТКА> — цвет метки предмета (строка: имя цвета
+#              gnuplot или #RRGGBB; 11 меток SG SS NG SNG GL RL LG GA YA RA MH;
+#              ключи ITEM_COLOR_* в heatmap.conf; отсутствующая переменная —
+#              встроенный дефолт, совместимость с прямыми вызовами)
 #
 # Ник игрока в gnuplot не передаётся (только слот pNNN) — защита от инъекций
 # через кавычки/спецсимволы в нике (FR-20).
@@ -58,11 +62,28 @@ MAX_MARKER_SIZE = real(HM_MAX_MARKER_SIZE)
 # утилитами) — иконки просто не рисуются; heatmap.sh передаёт его всегда
 ITEMS_FILE = (exists("HM_ITEMS_FILE") ? HM_ITEMS_FILE : "")
 
-# --- иконки предметов (SHOW_ITEMS, v1.0.12) ----------------------------------
-# blank_map/<map>.items, колонки: 1=X 2=Y 3=Z 4=группа (1 оружие / 2 броня) 5=метка.
-# Цвета и масштаб меток — константы (намеренно БЕЗ ключей конфига):
-ITEM_COLOR_WEAPON = 45056       # 0x00B000 зелёный — оружие (SG..LG)
-ITEM_COLOR_ARMOR  = 14721024    # 0xE0A000 янтарный — броня (GA/YA/RA)
+# --- иконки предметов (SHOW_ITEMS, v1.0.12; цвета/жирность/метки v1.0.13) -----
+# blank_map/<map>.items, колонки: 1=X 2=Y 3=Z 4=группа (1 оружие / 2 броня /
+# 3 мегахелс) 5=метка.
+# ВНИМАНИЕ: цвет в tc rgb var — ТОЛЬКО ЧИСЛО (0xRRGGBB): со строкой («orange»)
+# gnuplot 5.4.1 молча НЕ РИСУЕТ метку вовсе (проверено; неожиданно для
+# документации). heatmap.sh резолвит имена из ITEM_COLOR_* в 0xRRGGBB через
+# ImageMagick и передаёт числа HM_ITEM_COLOR_<МЕТКА>. Дефолты ниже — резолв
+# дефолтов heatmap.conf той же сборкой IM 6.9.11 (для прямых вызовов
+# xy.gnuplot без новых переменных):
+ITEM_C_SG  = (exists("HM_ITEM_COLOR_SG")  ? HM_ITEM_COLOR_SG  : 0x008000)
+ITEM_C_SS  = (exists("HM_ITEM_COLOR_SS")  ? HM_ITEM_COLOR_SS  : 0x008000)
+ITEM_C_NG  = (exists("HM_ITEM_COLOR_NG")  ? HM_ITEM_COLOR_NG  : 0x008000)
+ITEM_C_SNG = (exists("HM_ITEM_COLOR_SNG") ? HM_ITEM_COLOR_SNG : 0x008000)
+ITEM_C_GL  = (exists("HM_ITEM_COLOR_GL")  ? HM_ITEM_COLOR_GL  : 0x008000)
+ITEM_C_RL  = (exists("HM_ITEM_COLOR_RL")  ? HM_ITEM_COLOR_RL  : 0xFFA500)
+ITEM_C_LG  = (exists("HM_ITEM_COLOR_LG")  ? HM_ITEM_COLOR_LG  : 0x7E7E7E)
+ITEM_C_GA  = (exists("HM_ITEM_COLOR_GA")  ? HM_ITEM_COLOR_GA  : 0x008000)
+ITEM_C_YA  = (exists("HM_ITEM_COLOR_YA")  ? HM_ITEM_COLOR_YA  : 0xFFFF00)
+ITEM_C_RA  = (exists("HM_ITEM_COLOR_RA")  ? HM_ITEM_COLOR_RA  : 0xFF0000)
+ITEM_C_MH  = (exists("HM_ITEM_COLOR_MH")  ? HM_ITEM_COLOR_MH  : 0x87CEEB)
+# цвет по метке (колонка 5); неизвестная метка — пурпурный (диагностика)
+ITEM_COLOR_OF(l) = l eq "SG" ? ITEM_C_SG : l eq "SS" ? ITEM_C_SS : l eq "NG" ? ITEM_C_NG : l eq "SNG" ? ITEM_C_SNG : l eq "GL" ? ITEM_C_GL : l eq "RL" ? ITEM_C_RL : l eq "LG" ? ITEM_C_LG : l eq "GA" ? ITEM_C_GA : l eq "YA" ? ITEM_C_YA : l eq "RA" ? ITEM_C_RA : l eq "MH" ? ITEM_C_MH : 0xFF00FF
 # Метка крупнее маркера («чуть больше»): диаметр точки в pngcairo ≈ 7.3 ×
 # pointsize px, высота глифа ≈ 1.04 × pt; 1.3 × 7.3 ≈ 9.5 pt на единицу
 # pointsize маркера.
@@ -124,9 +145,11 @@ eval PCMD
 #       CB — сырой Z (при cbrange [MIN_Z:MAX_Z] палитра blue->red).
 CMD = sprintf("plot '%s' %s using ($1/SCALING):($2/SCALING):(column(4)==5 ? PT_MOVE : PT_DEATH):(((column(3)-MIN_Z)/(MAX_Z-MIN_Z))*(MAX_MARKER_SIZE-MIN_MARKER_SIZE)+MIN_MARKER_SIZE):(column(3)) with points pointsize var pointtype var lt palette", DATA_FILE, EVERY)
 # --- иконки предметов: вторым источником того же plot -> рисуются ПОВЕРХ
-# маркеров (передний план). Текст через enhanced {/=pt} — покадровый размер
-# шрифта; цвет — колонка-тернарник группы (tc rgb var).
+# маркеров (передний план). Текст через enhanced {/=pt {/:Bold …}} —
+# покадровый размер шрифта и ЖИРНОЕ начертание по умолчанию (v1.0.13,
+# вложенные enhanced-клаузы — по документации gnuplot 5.4); цвет — строка
+# по метке предмета (tc rgb var принимает строковые имена, проверено 5.4.1).
 if (strlen(ITEMS_FILE) > 0) {
-    CMD = CMD . sprintf(", '%s' using ($1/SCALING):($2/SCALING):(sprintf('{/=%d %s}', ITEM_FONT(column(3)), strcol(5))):(column(4)==1 ? ITEM_COLOR_WEAPON : ITEM_COLOR_ARMOR) with labels tc rgb var center", ITEMS_FILE)
+    CMD = CMD . sprintf(", '%s' using ($1/SCALING):($2/SCALING):(sprintf('{/=%d {/:Bold %s}}', ITEM_FONT(column(3)), strcol(5))):(ITEM_COLOR_OF(strcol(5))) with labels tc rgb var center", ITEMS_FILE)
 }
 eval CMD

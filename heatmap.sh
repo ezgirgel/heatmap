@@ -115,6 +115,31 @@ _hm_tool_path() {
 : "${MAX_MARKER_SIZE:=1.5}"
 # иконки предметов: точки спавна оружия/брони из entity lump карты (v1.0.12)
 : "${SHOW_ITEMS:=true}"
+# v1.0.13: какие ОРУЖИЯ рисовать — список через запятую из
+# SG SS NG SNG GL RL LG (регистр/пробелы игнорируются); пусто — оружие
+# не рисуется. Броня (GA YA RA) и мегахелс (MH) управляются только SHOW_ITEMS.
+# ВАЖНО: ${VAR-default} (а не :=) — пустая строка в конфиге НЕ заменяется
+# дефолтом, а означает «оружие не рисовать»
+: "${SHOW_WEAPONS-RL,LG}"
+# v1.0.13: скрывать предметы, перекрывающиеся на виде сверху: в радиусе 32
+# мировых единиц по X/Y (габарит предмета Quake 32x32) остаётся только
+# ВЕРХНИЙ (максимальный Z; при равенстве Z — первый в кэше)
+: "${HIDE_OVERLAPPED_ITEMS-false}"
+# v1.0.13: цвет метки каждого предмета — имя цвета ImageMagick/X11
+# (orange, gray, red, yellow, green, skyblue, …) или #RRGGBB / 0xRRGGBB.
+# Имя РЕЗОЛВИТСЯ в 0xRRGGBB при старте (gnuplot с строковым цветом молча
+# НЕ рисует метку — проверено на 5.4.1; резолв заодно и валидация FR-6).
+: "${ITEM_COLOR_SG-green}"
+: "${ITEM_COLOR_SS-green}"
+: "${ITEM_COLOR_NG-green}"
+: "${ITEM_COLOR_SNG-green}"
+: "${ITEM_COLOR_GL-green}"
+: "${ITEM_COLOR_RL-orange}"
+: "${ITEM_COLOR_LG-gray}"
+: "${ITEM_COLOR_GA-green}"
+: "${ITEM_COLOR_YA-yellow}"
+: "${ITEM_COLOR_RA-red}"
+: "${ITEM_COLOR_MH-skyblue}"
 : "${BLANK_MAP_NEGATE:=false}"
 : "${Z_OUTLIER_MIN_COUNT:=10}"
 : "${MAPINFO_PADDING:=10}"
@@ -157,13 +182,41 @@ validate_conf() {
         fi
     done
     # логические ключи
-    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO SHOW_ITEMS)
+    local bool_keys=(BLANK_MAP_NEGATE KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO SHOW_ITEMS HIDE_OVERLAPPED_ITEMS)
     for key in "${bool_keys[@]}"; do
         local v="${!key,,}"
         if [[ "$v" != "true" && "$v" != "false" ]]; then
             _die_early 1 "конфиг: ключ ${key}='${!key}' — допустимо true|false (FR-6)"
         fi
         printf -v "$key" '%s' "$v"
+    done
+    # SHOW_WEAPONS (v1.0.13): список оружий через запятую. Нормализация:
+    # пробелы срезаются, регистр — верхний; пусто = оружие не рисуется.
+    SHOW_WEAPONS_NORM=""
+    local _w="${SHOW_WEAPONS//[[:space:]]/}"
+    _w="${_w^^}"
+    if [[ -n "$_w" ]]; then
+        local _tok
+        local IFS=,
+        for _tok in $_w; do
+            case "$_tok" in
+                SG|SS|NG|SNG|GL|RL|LG) ;;
+                *) _die_early 1 "конфиг: SHOW_WEAPONS='${SHOW_WEAPONS}' — неизвестное оружие '${_tok}' (допустимо SG SS NG SNG GL RL LG; пусто = оружие не рисуется) (FR-6)" ;;
+            esac
+            SHOW_WEAPONS_NORM+="${_tok},"
+        done
+        SHOW_WEAPONS_NORM="${SHOW_WEAPONS_NORM%,}"
+    fi
+    # ITEM_COLOR_* (v1.0.13): грубая проверка формата (имя/#RRGGBB/0xRRGGBB);
+    # полная валидация имени — через ImageMagick при старте рендера
+    local color_re='^[A-Za-z0-9#._-]+$'
+    local color_keys=(ITEM_COLOR_SG ITEM_COLOR_SS ITEM_COLOR_NG ITEM_COLOR_SNG
+                      ITEM_COLOR_GL ITEM_COLOR_RL ITEM_COLOR_LG
+                      ITEM_COLOR_GA ITEM_COLOR_YA ITEM_COLOR_RA ITEM_COLOR_MH)
+    for key in "${color_keys[@]}"; do
+        if [[ ! "${!key}" =~ $color_re ]]; then
+            _die_early 1 "конфиг: ключ ${key}='${!key}' — не похоже на цвет (имя gnuplot/X11, #RRGGBB или 0xRRGGBB) (FR-6)"
+        fi
     done
     # маркеры: *_TYPE — целое 1..15; *_SIZE — число > 0 (7.3, FR-6)
     for key in MARKER_MOVE_TYPE MARKER_DEATH_TYPE; do
@@ -207,7 +260,10 @@ check_unknown_keys() {
         PALETTE_CUSTOM PALETTE_MIN_COLOR PALETTE_MAX_COLOR
         MARKER_MOVE_TYPE MARKER_DEATH_TYPE
         MIN_MARKER_SIZE MAX_MARKER_SIZE RESULT_COPY_DEMOINFO
-        SHOW_ITEMS
+        SHOW_ITEMS SHOW_WEAPONS HIDE_OVERLAPPED_ITEMS
+        ITEM_COLOR_SG ITEM_COLOR_SS ITEM_COLOR_NG ITEM_COLOR_SNG ITEM_COLOR_GL
+        ITEM_COLOR_RL ITEM_COLOR_LG ITEM_COLOR_GA ITEM_COLOR_YA ITEM_COLOR_RA
+        ITEM_COLOR_MH
         Z_OUTLIER_MIN_COUNT MAPINFO_PADDING MAPINFO_SCALING
         RETENTION_MAX_AGE_DAYS RETENTION_MAX_DIRS LOG_RETENTION_DAYS
         LOCK_WAIT_SEC KEEP_TMP_ON_FAIL RESULT_COPY_DEMOINFO NICE_LEVEL
@@ -320,6 +376,95 @@ gp_str() {
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
     printf '"%s"' "$s"
+}
+
+# ----------------------------------------------------------------------------
+# Резолв ITEM_COLOR_* в числа для gnuplot (v1.0.13): tc rgb var принимает
+# только ЧИСЛОВОЙ цвет — строковое имя молча НЕ РИСУЕТ метку (проверено на
+# 5.4.1). Имя цвета -> 0xRRGGBB через ImageMagick (заодно валидация FR-6:
+# неизвестное имя — фатально, gnuplot сам бы промолчал). #RRGGBB/0xRRGGBB
+# проходят без IM. Результат — ITEM_COLOR_<МЕТКА>_HEX="0xRRGGBB".
+# Вызывать ПОСЛЕ need_bin (нужен convert), ДО GNUPLOT_ITEM_COLORS — всегда
+# (не только при SHOW_ITEMS=true: проба рисует метки при любом SHOW_ITEMS).
+# ----------------------------------------------------------------------------
+_rgb_from_im() { # $1 = имя цвета -> "RRGGBB" (rc 1 = не распознано)
+    local out
+    out="$(convert -size 1x1 "xc:$1" -format '%[pixel:u.p{0,0}]' info: 2>/dev/null)" || return 1
+    if [[ "$out" =~ ^srgba?\(([0-9]+),([0-9]+),([0-9]+) ]]; then
+        printf '%02X%02X%02X' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    if [[ "$out" =~ ^gray\(([0-9]+)\) ]]; then
+        printf '%02X%02X%02X' "${BASH_REMATCH[1]}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$out" =~ ^#?([0-9A-Fa-f]{6})$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]^}"
+        return 0
+    fi
+    return 1
+}
+
+hm_resolve_item_colors() {
+    local key color hex
+    local color_keys=(ITEM_COLOR_SG ITEM_COLOR_SS ITEM_COLOR_NG ITEM_COLOR_SNG
+                      ITEM_COLOR_GL ITEM_COLOR_RL ITEM_COLOR_LG
+                      ITEM_COLOR_GA ITEM_COLOR_YA ITEM_COLOR_RA ITEM_COLOR_MH)
+    for key in "${color_keys[@]}"; do
+        color="${!key}"
+        case "$color" in
+            \#*) hex="${color#\#}" ;;
+            0[xX]*) hex="${color:2}" ;;
+            *) hex="$(_rgb_from_im "$color")" \
+                || die 1 "конфиг: ключ ${key}='${color}' — ImageMagick не знает такой цвет (допустимо имя IM/X11, #RRGGBB или 0xRRGGBB) (FR-6)" ;;
+        esac
+        hex="$(printf '%s' "$hex" | tr 'a-f' 'A-F')"
+        if [[ ! "$hex" =~ ^[0-9A-F]{6}$ ]]; then
+            die 1 "конфиг: ключ ${key}='${color}' — не похоже на цвет (имя IM/X11, #RRGGBB или 0xRRGGBB) (FR-6)"
+        fi
+        printf -v "${key}_HEX" '%s' "0x${hex}"
+    done
+}
+
+# ----------------------------------------------------------------------------
+# Фильтр иконок предметов (v1.0.13): (1) оружие проходит только если его
+# метка в SHOW_WEAPONS_NORM (броня и мегахелс — всегда); (2) при
+# HIDE_OVERLAPPED_ITEMS=true из предметов, перекрывающихся на виде сверху
+# (расстояние по X/Y < ITEMS_OVERLAP_RADIUS мировых единиц), остаётся только
+# ВЕРХНИЙ — с максимальным Z (при равенстве Z — первый в файле; правило
+# детерминировано и не зависит от сортировки).
+# ----------------------------------------------------------------------------
+filter_items_awk() { # $1 = источник (кэш), $2 = приёмник (файл для gnuplot)
+    awk -v W="${SHOW_WEAPONS_NORM}" \
+        -v DEDUP="$([[ "$HIDE_OVERLAPPED_ITEMS" == "true" ]] && echo 1 || echo 0)" \
+        -v R="${ITEMS_OVERLAP_RADIUS}" '
+        BEGIN {
+            R2 = R * R
+            nw = split(W, wa, ",")
+            for (i = 1; i <= nw; i++) if (wa[i] != "") want[wa[i]] = 1
+        }
+        /^#/ { next }
+        NF >= 5 {
+            g = $4 + 0
+            if (g == 1 && !($5 in want)) next
+            n++; ax[n] = $1 + 0; ay[n] = $2 + 0; az[n] = $3 + 0
+            ag[n] = g; al[n] = $5
+        }
+        END {
+            if (DEDUP == 1) {
+                for (i = 1; i <= n; i++)
+                    for (j = 1; j <= n; j++) {
+                        if (j == i) continue
+                        dx = ax[j] - ax[i]; dy = ay[j] - ay[i]
+                        if (dx * dx + dy * dy >= R2) continue
+                        if (az[j] > az[i] || (az[j] == az[i] && j < i)) { hidden[i] = 1; break }
+                    }
+            }
+            for (i = 1; i <= n; i++)
+                if (!(i in hidden))
+                    printf "%g %g %g %d %s\n", ax[i], ay[i], az[i], ag[i], al[i]
+        }
+    ' "$1" > "$2"
 }
 
 # ----------------------------------------------------------------------------
@@ -675,33 +820,64 @@ if [[ ! -f "$JSON_PATH" ]]; then
 fi
 
 # ----------------------------------------------------------------------------
-# Иконки предметов (SHOW_ITEMS, v1.0.12): точки спавна оружия/брони из
-# entity lump карты. Кэш blank_map/<map>.items (X Y Z группа метка):
-# генерируется при отсутствии или когда .bsp новее кэша. Любая проблема
-# (нет .bsp, сбой экстрактора) — только WARN: иконки — украшение, партия
-# рендерится без них. Пустой файл (на карте нет подходящих предметов) —
-# норма: рисуются только маркеры.
+# Иконки предметов (SHOW_ITEMS, v1.0.12; оружие/цвета/перекрытия v1.0.13):
+# точки спавна оружия/брони/мегахелса из entity lump карты. Кэш
+# blank_map/<map>.items (строка 1 — маркер версии формата, далее
+# «X Y Z группа метка»): генерируется при отсутствии, когда .bsp новее кэша
+# ИЛИ маркер версии не совпадает (кэш старого v1.0.12 — без RA/мегахелса).
+# Затем кэш фильтруется: оружие по SHOW_WEAPONS, перекрытия по
+# HIDE_OVERLAPPED_ITEMS. Любая проблема (нет .bsp, сбой экстрактора) —
+# только WARN: иконки — украшение, партия рендерится без них. Пустой кэш
+# (на карте нет подходящих предметов) — норма: рисуются только маркеры.
 # ----------------------------------------------------------------------------
+ITEMS_CACHE_HEADER="# heatmap-items-cache v2"
+# радиус перекрытия иконок по X/Y, мировых единиц (габарит предмета Quake
+# 32x32; два предмета ближе этого расстояния на виде сверху сливаются)
+ITEMS_OVERLAP_RADIUS=32
 ITEMS_GNUPLOT=""
+hm_resolve_item_colors
 if [[ "$SHOW_ITEMS" == "true" ]]; then
     ITEMS_PATH="${BLANK_MAP_DIR}/${MAP}.items"
     EXTRACT_ITEMS="${TOOLS_DIR}/extract_items.py"
+    NEED_GEN=0
     if [[ ! -f "$BSP_PATH" ]]; then
         log WARN "иконки предметов: нет исходника карты ${BSP_PATH} — иконки не рисуются"
     elif [[ ! -f "$EXTRACT_ITEMS" ]]; then
         log WARN "иконки предметов: экстрактор не найден: ${EXTRACT_ITEMS} — иконки не рисуются"
-    elif [[ ! -f "$ITEMS_PATH" || "$BSP_PATH" -nt "$ITEMS_PATH" ]]; then
+    elif [[ ! -f "$ITEMS_PATH" ]]; then
+        NEED_GEN=1
+    elif [[ "$BSP_PATH" -nt "$ITEMS_PATH" ]]; then
+        NEED_GEN=1
+    elif [[ "$(head -n 1 "$ITEMS_PATH" 2>/dev/null)" != "$ITEMS_CACHE_HEADER" ]]; then
+        log INFO "кэш точек предметов старого формата (v1.0.12: без RA/мегахелса) — регенерация (v1.0.13)"
+        NEED_GEN=1
+    fi
+    if (( NEED_GEN == 1 )); then
         log INFO "генерация точек предметов: ${BSP_PATH} -> ${ITEMS_PATH}"
         if ! python3 "$EXTRACT_ITEMS" "$BSP_PATH" --output "$ITEMS_PATH"; then
             log WARN "extract_items.py не удался — иконки не рисуются"
         fi
-    else
+    elif [[ -f "$ITEMS_PATH" ]]; then
         log INFO "иконки предметов: кэш ${ITEMS_PATH} актуален"
     fi
+    # старый кэш без .bsp (легаси) используем как есть, но предупреждаем:
+    # в нём нет мегахелса и красной брони
+    if [[ -f "$ITEMS_PATH" && ! -f "$BSP_PATH" ]] \
+       && [[ "$(head -n 1 "$ITEMS_PATH" 2>/dev/null)" != "$ITEMS_CACHE_HEADER" ]]; then
+        log WARN "кэш точек предметов старого формата (v1.0.12) без .bsp — метки RA/MH могут отсутствовать; для регенерации нужен исходник карты"
+    fi
     if [[ -s "${ITEMS_PATH:-}" ]]; then
-        ITEMS_GNUPLOT="$ITEMS_PATH"
-        ITEM_COUNT="$(wc -l < "$ITEMS_PATH")"
-        log INFO "иконки предметов: ${ITEM_COUNT} шт. (${ITEMS_PATH})"
+        ITEMS_RAW_COUNT="$(grep -vc '^#' "$ITEMS_PATH" 2>/dev/null || true)"
+        ITEMS_RAW_COUNT="${ITEMS_RAW_COUNT:-0}"
+        ITEMS_FILTERED="${RUN_DIR}/items.filtered"
+        filter_items_awk "$ITEMS_PATH" "$ITEMS_FILTERED"
+        ITEM_COUNT="$(wc -l < "$ITEMS_FILTERED" | tr -d ' ')"
+        if (( ITEM_COUNT > 0 )); then
+            ITEMS_GNUPLOT="$ITEMS_FILTERED"
+            log INFO "иконки предметов: в кэше ${ITEMS_RAW_COUNT} шт., к рендеру ${ITEM_COUNT} шт. (оружие: ${SHOW_WEAPONS_NORM:-нет}; перекрытия: $([[ "$HIDE_OVERLAPPED_ITEMS" == "true" ]] && echo "скрывать" || echo "показывать"); скрыто: $((ITEMS_RAW_COUNT - ITEM_COUNT)))"
+        else
+            log INFO "иконки предметов: 0 шт. — рисуются только маркеры"
+        fi
     else
         log INFO "иконки предметов: 0 шт. — рисуются только маркеры"
     fi
@@ -739,14 +915,44 @@ if ! awk -v s="$SCALING" 'BEGIN{exit !(s>0)}'; then die 3 "mapinfo: scaling до
 log INFO "рендер: ${IMG_WIDTH}x${IMG_HEIGHT}, padding=${PADDING}, scaling=${SCALING}, X[${MIN_X}:${MAX_X}] Y[${MIN_Y}:${MAX_Y}]"
 
 # ----------------------------------------------------------------------------
+# Цвета иконок предметов -> gnuplot (v1.0.13): ЧИСЛА 0xRRGGBB, резолвнутые
+# hm_resolve_item_colors из строк конфига (tc rgb var со строкой молча не
+# рисует метку). Строка GNUPLOT_ITEM_COLORS добавляется в пробу и в базу.
+# ----------------------------------------------------------------------------
+GNUPLOT_ITEM_COLORS="; HM_ITEM_COLOR_SG=${ITEM_COLOR_SG_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_SS=${ITEM_COLOR_SS_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_NG=${ITEM_COLOR_NG_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_SNG=${ITEM_COLOR_SNG_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_GL=${ITEM_COLOR_GL_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_RL=${ITEM_COLOR_RL_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_LG=${ITEM_COLOR_LG_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_GA=${ITEM_COLOR_GA_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_YA=${ITEM_COLOR_YA_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_RA=${ITEM_COLOR_RA_HEX}"
+GNUPLOT_ITEM_COLORS+="; HM_ITEM_COLOR_MH=${ITEM_COLOR_MH_HEX}"
+
+# ----------------------------------------------------------------------------
 # Стартовая gnuplot-проба (FR-36): мини-рендер с настроенной палитрой/маркерами
-# и метками предметов (синтетический probe.items — синтаксис items-plot
-# проверяется при любом SHOW_ITEMS/наполнении карты)
+# и метками предметов — пробный items-файл содержит ВСЕ 11 меток, поэтому
+# каждый запуск проверяет синтаксис items-plot и все строки цветов (имена
+# проверены выше через ImageMagick; gnuplot получает их как есть)
 # ----------------------------------------------------------------------------
 PROBE_DIR="${RUN_DIR}/probe"
 mkdir -p "$PROBE_DIR"
 printf '0 0 0 5\n10 0 0 2\n-10 0 0 5\n' > "${PROBE_DIR}/probe.data"
-printf '5 5 0 1 RL\n-5 -5 0 2 YA\n' > "${PROBE_DIR}/probe.items"
+cat > "${PROBE_DIR}/probe.items" <<'EOF'
+5 5 0 1 SG
+-5 5 0 1 SS
+5 -5 0 1 NG
+-5 -5 0 1 SNG
+8 8 0 1 GL
+-8 8 0 1 RL
+8 -8 0 1 LG
+-8 -8 0 2 GA
+6 6 0 2 YA
+-6 6 0 2 RA
+6 -6 0 3 MH
+EOF
 _GNUPLOT_VARS="HM_DATA_FILE=$(gp_str "${PROBE_DIR}/probe.data")"
 _GNUPLOT_VARS+="; HM_OUT_DIR=$(gp_str "$PROBE_DIR")"
 _GNUPLOT_VARS+="; HM_NAME=$(gp_str "probe"); HM_FRAME=0; HM_EVERY=\"\""
@@ -759,6 +965,7 @@ _GNUPLOT_VARS+="; HM_PALETTE_CUSTOM=$(gp_str "$PALETTE_CUSTOM")"
 _GNUPLOT_VARS+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 _GNUPLOT_VARS+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
 _GNUPLOT_VARS+="; HM_ITEMS_FILE=$(gp_str "${PROBE_DIR}/probe.items")"
+_GNUPLOT_VARS+="${GNUPLOT_ITEM_COLORS}"
 if ! gnuplot -e "$_GNUPLOT_VARS" "$GNUPLOT_SCRIPT" 2> "${PROBE_DIR}/probe.err"; then
     log ERROR "стартовая gnuplot-проба не прошла — проверьте PALETTE_*/MARKER_* в конфиге (FR-36):"
     sed 's/^/    /' "${PROBE_DIR}/probe.err" 2>/dev/null || true
@@ -868,6 +1075,7 @@ GNUPLOT_BASE+="; HM_PALETTE_MIN_COLOR=$(gp_str "$PALETTE_MIN_COLOR")"
 GNUPLOT_BASE+="; HM_PALETTE_MAX_COLOR=$(gp_str "$PALETTE_MAX_COLOR")"
 # иконки предметов: пустая строка = xy.gnuplot рисует только маркеры
 GNUPLOT_BASE+="; HM_ITEMS_FILE=$(gp_str "$ITEMS_GNUPLOT")"
+GNUPLOT_BASE+="${GNUPLOT_ITEM_COLORS}"
 
 # ----------------------------------------------------------------------------
 # Обработка игроков (FR-18..25) — таймеры этапов "кадры" и "сборка GIF"

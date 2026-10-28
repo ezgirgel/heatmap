@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-extract_items.py — извлечение точек спавна оружия/брони из entity lump карты.
+extract_items.py — извлечение точек спавна оружия/брони/мегахелса из entity
+lump карты.
 
 Читает <map>.bsp (BSP29 / BSP2 / 2PSB) и пишет blank_map/<map>.items —
 построчный файл для gnuplot:
+    # heatmap-items-cache v2      <- заголовок-маркер версии формата (строка 1)
     X Y Z ГРУППА МЕТКА
-где ГРУППА: 1 = оружие, 2 = броня; МЕТКА — краткое имя предмета
-(SG SS NG SNG GL RL LG / GA YA RA). Координаты — мировые (как в демке),
-gnuplot делит X/Y на SCALING так же, как данные игроков.
+где ГРУППА: 1 = оружие, 2 = броня, 3 = мегахелс; МЕТКА — краткое имя
+предмета (SG SS NG SNG GL RL LG / GA YA RA / MH). Координаты — мировые
+(как в демке), gnuplot делит X/Y на SCALING так же, как данные игроков.
+Заголовок-маркер позволяет heatmap.sh отследить кэш старого формата
+(v1.0.12 без заголовка/мегахелса/исправленного RA) и перегенерировать его.
 
-Кэш: heatmap.sh вызывает экстрактор только если <map>.items отсутствует
-или .bsp новее кэша. Пустая карта (нет подходящих entity) — пустой файл,
+Кэш: heatmap.sh вызывает экстрактор только если <map>.items отсутствует,
+.bsp новее кэша или первая строка кэша не совпадает с маркером версии.
+Пустая карта (нет подходящих entity) — файл только с заголовком,
 код возврата 0.
 
-Поддерживаемые classnames (QuakeWorld, id1):
+Поддерживаемые classnames (QuakeWorld, id1 — совпадает со спавн-функциями
+KTX src/items.c):
     weapon_shotgun weapon_supershotgun weapon_nailgun weapon_supernailgun
     weapon_grenadelauncher weapon_rocketlauncher weapon_lightning
-    item_armor1 (зелёная) item_armor2 (жёлтая) item_armor3 (красная)
+    item_armor1 (зелёная GA) item_armor2 (жёлтая YA) item_armorInv (красная RA)
+    item_health со spawnflags&2 (мегахелс MH); spawnflags&1 (гнилая еда)
+    и обычные аптечки не рисуются.
+
+    ВНИМАНИЕ: classname "item_armor3" НЕ существует ни в ванильном Quake,
+    ни в KTX (проверено по исходникам KTX) — красная броня всегда
+    item_armorInv. В v1.0.12 экстрактор ошибочно искал item_armor3, из-за
+    чего RA не отображалась ни на одной карте (в т.ч. baldm6). Несуществующий
+    classname намеренно НЕ поддержан: такой entity не спавнится сервером,
+    и иконка была бы ложной.
 
 Форматы BSP:
     BSP29  — version int32 == 29, каталог: 15 lump'ов (int32 ofs, int32 len)
@@ -47,8 +62,16 @@ ITEM_CLASSES = {
     "weapon_lightning":        ("LG",  1),
     "item_armor1":             ("GA",  2),
     "item_armor2":             ("YA",  2),
-    "item_armor3":             ("RA",  2),
+    "item_armorinv":           ("RA",  2),
 }
+
+# item_health: биты spawnflags (items.qc / KTX src/items.c: гнилая еда
+# проверяется ПЕРВОЙ — "spawnflags 3" означает гнилую, не мегахелс)
+HEALTH_ROTTEN = 1
+HEALTH_MEGA = 2
+
+# маркер версии формата кэша — первая строка файла (см. шапку модуля)
+CACHE_HEADER = "# heatmap-items-cache v2"
 
 BSP2_MAGICS = (b"BSP2", b"2PSB")
 BSP29_VERSION = 29
@@ -123,6 +146,21 @@ def read_entities_lump(bsp_path: str) -> str:
     return data.decode("latin-1")
 
 
+def parse_spawnflags(block: str, bsp_path: str, classname: str) -> int:
+    """spawnflags entity (int; отсутствует/битый -> 0 с WARN для битого)."""
+    m_sf = re.search(r'"spawnflags"\s+"([^"]*)"', block)
+    if not m_sf:
+        return 0
+    try:
+        return int(m_sf.group(1).strip())
+    except ValueError:
+        warn(
+            "%s: '%s' spawnflags '%s' — не число, считается 0"
+            % (os.path.basename(bsp_path), classname, m_sf.group(1))
+        )
+        return 0
+
+
 def parse_items(entities_text: str, bsp_path: str):
     """Извлекает (x, y, z, группа, метка) из entity-блоков. Порядок файлов."""
     items = []
@@ -131,9 +169,19 @@ def parse_items(entities_text: str, bsp_path: str):
         if not m_cls:
             continue
         classname = m_cls.group(1).strip().lower()
-        if classname not in ITEM_CLASSES:
-            continue
-        label, group = ITEM_CLASSES[classname]
+        if classname == "item_health":
+            # мегахелс: spawnflags&2 (гнилая еда — spawnflags&1 — проверяется
+            # первой, как в items.qc/KTX); обычные аптечки не рисуются
+            sf = parse_spawnflags(block, bsp_path, classname)
+            if sf & HEALTH_ROTTEN:
+                continue
+            if not sf & HEALTH_MEGA:
+                continue
+            label, group = "MH", 3
+        else:
+            if classname not in ITEM_CLASSES:
+                continue
+            label, group = ITEM_CLASSES[classname]
         m_org = re.search(r'"origin"\s+"([^"]*)"', block)
         if not m_org:
             warn(
@@ -182,14 +230,19 @@ def main() -> int:
 
     try:
         with open(out_path, "w", encoding="ascii") as fh:
+            fh.write(CACHE_HEADER + "\n")
             for x, y, z, group, label in items:
                 fh.write("%g %g %g %d %s\n" % (x, y, z, group, label))
     except OSError as exc:
         fail("не удалось записать '%s': %s" % (out_path, exc))
 
     weapons = sum(1 for it in items if it[3] == 1)
-    armor = len(items) - weapons
-    print("INFO: %s: предметов %d (оружие %d, броня %d)" % (out_path, len(items), weapons, armor))
+    armor = sum(1 for it in items if it[3] == 2)
+    mega = sum(1 for it in items if it[3] == 3)
+    print(
+        "INFO: %s: предметов %d (оружие %d, броня %d, мегахелс %d)"
+        % (out_path, len(items), weapons, armor, mega)
+    )
     return 0
 
 
